@@ -21,26 +21,36 @@ class RAGalicClient:
     def __init__(self, path: str = str(lib_path / "qdrant_db"), **kwargs):
         if self._initialized:
             return
-        self._client = QdrantClient(path=path, **kwargs)
-        self._client.set_model("jinaai/jina-embeddings-v3")
-        self._client.set_sparse_model("Qdrant/bm25")
+        self.path = path
+        self.kwargs = kwargs
+        self._client = None
         self._initialized = True
-        print("Successfully connected to Qdrant.")
+
+    def _setup_connection(self):
+        """Внутренний метод для реального подключения"""
+        if self._client is None:
+            self._client = QdrantClient(path=self.path, **self.kwargs)
+            self._client.set_model("jinaai/jina-embeddings-v3")
+            self._client.set_sparse_model("Qdrant/bm25")
+            print("Successfully connected to Qdrant.")
 
     def __enter__(self):
+        self._setup_connection()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
     def close(self):
-        """Явное закрытие — предотвращает ошибку при завершении"""
-        if hasattr(self, "_client") and self._client:
+        if self._client:
             self._client.close()
             self._client = None
+            print("Connection closed.")
 
     @property
     def client(self):
+        if self._client is None:
+            self._setup_connection()
         return self._client
 
 
@@ -53,32 +63,53 @@ class OpenAIClient:
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, api_key: str = API_KEY, base_url: str = URL_BASE):
-        if not self._initialized:
-            self._client = OpenAI(api_key=api_key, base_url=base_url)
-            self._initialized = True
+    def __init__(
+        self, api_key: str | None = None, url_base: str | None = None, **kwargs
+    ):
+        if self._initialized:
+            return
+        self.api_key = api_key or API_KEY
+        self.url_base = url_base or URL_BASE
+        self.kwargs = kwargs
+        self._client = None
+        self._initialized = True
+
+    def _setup_connection(self):
+        """Внутренний метод для реального подключения"""
+        if self._client is None:
+            self._client = OpenAI(
+                api_key=self.api_key, base_url=self.url_base, **self.kwargs
+            )
+            print("Successfully connected to OpenAI.")
 
     def __enter__(self):
+        self._setup_connection()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
     def close(self):
-        """Явное закрытие — предотвращает ошибку при завершении"""
-        if hasattr(self, "_client") and self._client:
+        if self._client:
             self._client.close()
             self._client = None
+            print("Connection closed.")
 
     @property
     def client(self):
+        if self._client is None:
+            self._setup_connection()
         return self._client
 
 
 # Глобальный экземпляр (ленивая инициализация)
 def get_ragalic_client(**kwargs) -> RAGalicClient:
-    return RAGalicClient(**kwargs)
+    client = RAGalicClient(**kwargs)
+    client._setup_connection()
+    return client
 
 
 def get_openai_client(**kwargs) -> OpenAIClient:
-    return OpenAIClient(**kwargs)
+    client = OpenAIClient(**kwargs)
+    client._setup_connection()
+    return client
