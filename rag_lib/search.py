@@ -21,7 +21,9 @@ from .dataschemes import Chunk
 
 console = Console()
 
-BEAM_SEARCH_METHODS = Literal["fixed", "adaptive_with_knee"]
+BEAM_SEARCH_METHODS = Literal[
+    "fixed", "adaptive_with_knee", "adaptive_with_sensitive_knee"
+]
 
 
 def prepare_chunks(points: list[ScoredPoint]) -> list[Chunk]:
@@ -190,7 +192,7 @@ def check_ids(old_ids: list, new_ids: list):
 def cut_knee(points: list[ScoredPoint]) -> list[ScoredPoint]:
     """
     Отсекает 'хвост' результатов, находя точку максимального изгиба (колено)
-    на графике RRF-скоров.
+    на графике RRF-скоров. Нормированная версия, которая учитывает разные масштабы по осям.
     """
     n_points = len(points)
 
@@ -201,13 +203,20 @@ def cut_knee(points: list[ScoredPoint]) -> list[ScoredPoint]:
     x = np.arange(n_points)
     y = scores
 
-    p1 = np.array([x[0], y[0]])
-    p2 = np.array([x[-1], y[-1]])
+    x_norm = (x - x.min()) / (x.max() - x.min())
+
+    y_range = y.max() - y.min()
+    if y_range == 0:
+        return points
+    y_norm = (y - y.min()) / y_range
+
+    p1 = np.array([x_norm[0], y_norm[0]])
+    p2 = np.array([x_norm[-1], y_norm[-1]])
 
     line_vec = p2 - p1
     line_vec_norm = line_vec / np.linalg.norm(line_vec)
 
-    points_vec = np.vstack([x - p1[0], y - p1[1]]).T
+    points_vec = np.vstack([x_norm - p1[0], y_norm - p1[1]]).T
 
     scalar_product = (
         points_vec[:, 0] * line_vec_norm[1] - points_vec[:, 1] * line_vec_norm[0]
@@ -219,11 +228,60 @@ def cut_knee(points: list[ScoredPoint]) -> list[ScoredPoint]:
     return points[: knee_idx + 1]
 
 
+def cut_knee_flexible(
+    points: list[ScoredPoint], sensitivity: float = 0.5
+) -> list[ScoredPoint]:
+    """
+    Отсекает 'хвост' результатов, находя точку максимального изгиба (колено)
+    на графике RRF-скоров. Нормированная версия, которая учитывает разные масштабы по осям и позволяет более гибко настраивать чувствительность среза.
+    """
+    n_points = len(points)
+
+    if n_points <= 2:
+        return points
+
+    scores = np.array([p.score for p in points])
+    x = np.arange(n_points)
+    y = scores
+
+    x_norm = (x - x.min()) / (x.max() - x.min())
+
+    y_range = y.max() - y.min()
+    if y_range == 0:
+        return points
+    y_norm = (y - y.min()) / y_range
+
+    p1 = np.array([x_norm[0], y_norm[0]])
+    p2 = np.array([x_norm[-1], y_norm[-1]])
+
+    line_vec = p2 - p1
+    line_vec_norm = line_vec / np.linalg.norm(line_vec)
+
+    points_vec = np.vstack([x_norm - p1[0], y_norm - p1[1]]).T
+
+    scalar_product = (
+        points_vec[:, 0] * line_vec_norm[1] - points_vec[:, 1] * line_vec_norm[0]
+    )
+    distances = np.abs(scalar_product)
+
+    knee_idx = np.argmax(distances)
+
+    max_dist = np.max(distances)
+
+    threshold = max_dist * sensitivity
+
+    indices_above_threshold = np.where(distances >= threshold)[0]
+    knee_idx = indices_above_threshold[-1]
+
+    return points[: knee_idx + 1]
+
+
 def parents_vs_children(
     query: str,
     parents: list[ScoredPoint],
     width: int = 3,
     search_method: BEAM_SEARCH_METHODS = "fixed",
+    sensitivity: float = 0.85,
 ) -> list[ScoredPoint]:
     task_meta = {
         "file_names": [],
@@ -285,6 +343,28 @@ def parents_vs_children(
     children_to_eliminate = []
     parents_to_eliminate = []
     new_top_k = []
+
+    if search_method == "adaptive_with_knee":
+        console.print(
+            f"Applying KNEE method to cut the tail of results. Initial candidates: {len(sorted_points)}",
+            style="italic bright_black",
+        )
+        sorted_points = cut_knee(sorted_points)
+        console.print(
+            f"Candidates after KNEE cut: {len(sorted_points)}",
+            style="italic bright_black",
+        )
+    elif search_method == "adaptive_with_sensitive_knee":
+        console.print(
+            f"Applying SENSITIVE KNEE method to cut the tail of results with sensitivity {sensitivity}. Initial candidates: {len(sorted_points)}",
+            style="italic bright_black",
+        )
+        sorted_points = cut_knee_flexible(sorted_points, sensitivity=sensitivity)
+        console.print(
+            f"Candidates after SENSITIVE KNEE cut: {len(sorted_points)}",
+            style="italic bright_black",
+        )
+
     for point in sorted_points:
         p_id = point.payload["id"]
 
@@ -301,17 +381,6 @@ def parents_vs_children(
 
         if search_method == "fixed" and len(new_top_k) >= width:
             break
-
-    if search_method == "adaptive_with_knee":
-        console.print(
-            f"Applying KNEE method to cut the tail of results. Initial candidates: {len(new_top_k)}",
-            style="italic bright_black",
-        )
-        new_top_k = cut_knee(new_top_k)
-        console.print(
-            f"Candidates after KNEE cut: {len(new_top_k)}",
-            style="italic bright_black",
-        )
 
     new_top_k_meta = [
         f"(ID: {point.payload['id']} | FILE: {point.payload['file_name']} | PAGES: {point.payload['page_start']} - {point.payload['page_end']})"
@@ -334,6 +403,7 @@ def beam_search(
     beam_width: int = 3,
     search_method: BEAM_SEARCH_METHODS = "fixed",
     max_num_roots: int = 20,
+    sensitivity: float = 0.5,
 ) -> list[Chunk]:
     if search_method == "fixed":
         console.print(
@@ -341,11 +411,20 @@ def beam_search(
             style="bold cyan",
         )
         old_points = find_roots(query=query, num_to_find=beam_width)
-    elif search_method == "adaptive_with_knee":
-        console.print(
-            f"Running BEAM SEARCH with [underline]ADAPTIVE[/underline] width using KNEE method",
-            style="bold cyan",
-        )
+    elif (
+        search_method == "adaptive_with_knee"
+        or search_method == "adaptive_with_sensitive_knee"
+    ):
+        if search_method == "adaptive_with_sensitive_knee":
+            console.print(
+                f"Running BEAM SEARCH with [underline]ADAPTIVE[/underline] width using [underline]SENSITIVE KNEE[/underline] method with sensitivity {sensitivity}",
+                style="bold cyan",
+            )
+        else:
+            console.print(
+                f"Running BEAM SEARCH with [underline]ADAPTIVE[/underline] width using [underline]KNEE[/underline] method",
+                style="bold cyan",
+            )
         with RAGalicClient() as client:
             root_filter = Filter(
                 must=[
@@ -365,11 +444,18 @@ def beam_search(
             f"Initial root points retrieved: {len(old_points)}",
             style="italic bright_black",
         )
-        old_points = cut_knee(old_points)
-        console.print(
-            f"Root points after KNEE cut: {len(old_points)}",
-            style="italic bright_black",
-        )
+        if search_method == "adaptive_with_knee":
+            old_points = cut_knee(old_points)
+            console.print(
+                f"Root points after KNEE cut: {len(old_points)}",
+                style="italic bright_black",
+            )
+        elif search_method == "adaptive_with_sensitive_knee":
+            old_points = cut_knee_flexible(old_points, sensitivity=sensitivity)
+            console.print(
+                f"Root points after KNEE cut: {len(old_points)}",
+                style="italic bright_black",
+            )
     new_points = []
 
     old_ids = [point.payload["id"] for point in old_points]
@@ -381,6 +467,7 @@ def beam_search(
             parents=old_points,
             width=beam_width,
             search_method=search_method,
+            sensitivity=sensitivity,
         )
         old_points = new_points
         new_ids = [point.payload["id"] for point in new_points]
@@ -394,7 +481,10 @@ def beam_search(
 
 
 if __name__ == "__main__":
-    test_query = "Summarize the court's final ruling in case CFI 010/2024."
+    test_query = "Which laws are administered by the Registrar and what are their respective citation titles?"
     branch_search(query=test_query)
     beam_search(query=test_query)
     beam_search(query=test_query, search_method="adaptive_with_knee")
+    beam_search(
+        query=test_query, search_method="adaptive_with_sensitive_knee", sensitivity=0.9
+    )
