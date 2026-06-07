@@ -113,33 +113,14 @@ def find_roots(
             only_roots=True,
         )
     else:
-        with RAGalicClient() as client:
-            dense_model: str = client.client.embedding_model_name  # type: ignore
-            sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-            must = [FieldCondition(key="parent_id", match=MatchValue(value=-1))]
-            if extra_filter is not None and extra_filter.must:
-                must.extend(extra_filter.must)  # type: ignore
-            root_filter = Filter(must=must)
-            points = client.client.query_points(  # type: ignore
-                collection_name=collection_name,
-                prefetch=[
-                    Prefetch(
-                        query=Document(text=query, model=dense_model),
-                        using="dense",
-                        limit=num_to_find * 3,
-                        filter=root_filter,
-                    ),
-                    Prefetch(
-                        query=Document(text=query, model=sparse_model),
-                        using="sparse",
-                        limit=num_to_find * 3,
-                        filter=root_filter,
-                    ),
-                ],
-                query_filter=root_filter,
-                query=FusionQuery(fusion=Fusion.RRF),
-                limit=num_to_find,
-            ).points
+        points = _unweighted_rrf_query(
+            collection_name=collection_name,
+            query=query,
+            limit=num_to_find,
+            paper_filter=extra_filter,
+            only_roots=True,
+            fetch_oversample=3,
+        )
     names = [f"{point.payload['file_name']}" for point in points]
     console.print(f"Found roots of files: {names}", style="italic purple")
     return points
@@ -189,32 +170,13 @@ def parent_vs_children(
             candidate_ids=all_ids,
         )
     else:
-        with RAGalicClient() as client:
-            dense_model: str = client.client.embedding_model_name  # type: ignore
-            sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-            children_and_parent_filter = Filter(
-                must=FieldCondition(key="id", match=MatchAny(any=all_ids))
-            )
-            sorted_points = client.client.query_points(
-                collection_name=collection_name,
-                prefetch=[
-                    Prefetch(
-                        query=Document(text=query, model=dense_model),
-                        using="dense",
-                        limit=len(all_ids),
-                        filter=children_and_parent_filter,
-                    ),
-                    Prefetch(
-                        query=Document(text=query, model=sparse_model),
-                        using="sparse",
-                        limit=len(all_ids),
-                        filter=children_and_parent_filter,
-                    ),
-                ],
-                query=FusionQuery(fusion=Fusion.RRF),
-                query_filter=children_and_parent_filter,
-                limit=len(all_ids),
-            ).points
+        sorted_points = _unweighted_rrf_query(
+            collection_name=collection_name,
+            query=query,
+            limit=len(all_ids),
+            candidate_ids=all_ids,
+            fetch_oversample=1,
+        )
 
     children_better_then_parent = []
     for point in sorted_points:
@@ -449,32 +411,13 @@ def parents_vs_children(
             candidate_ids=all_ids,
         )
     else:
-        with RAGalicClient() as client:
-            dense_model: str = client.client.embedding_model_name  # type: ignore
-            sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-            all_vs_all_filter = Filter(
-                must=FieldCondition(key="id", match=MatchAny(any=all_ids))
-            )
-            sorted_points = client.client.query_points(
-                collection_name=collection_name,
-                prefetch=[
-                    Prefetch(
-                        query=Document(text=query, model=dense_model),
-                        using="dense",
-                        limit=len(all_ids),
-                        filter=all_vs_all_filter,
-                    ),
-                    Prefetch(
-                        query=Document(text=query, model=sparse_model),
-                        using="sparse",
-                        limit=len(all_ids),
-                        filter=all_vs_all_filter,
-                    ),
-                ],
-                query=FusionQuery(fusion=Fusion.RRF),
-                query_filter=all_vs_all_filter,
-                limit=len(all_ids),
-            ).points
+        sorted_points = _unweighted_rrf_query(
+            collection_name=collection_name,
+            query=query,
+            limit=len(all_ids),
+            candidate_ids=all_ids,
+            fetch_oversample=1,
+        )
 
     children_to_eliminate = []
     parents_to_eliminate = []
@@ -673,6 +616,75 @@ def beam_search(
 ##################
 
 
+def _build_must_clauses(
+    *,
+    paper_filter: Filter | None,
+    candidate_ids: list[int] | None,
+    only_roots: bool,
+) -> list:
+    """Shared filter-clause assembly used by both the unweighted and
+    weighted RRF helpers — keeps the must-list construction in one place."""
+    must: list = []
+    if only_roots:
+        must.append(FieldCondition(key="parent_id", match=MatchValue(value=-1)))
+    if paper_filter is not None and paper_filter.must:
+        must.extend(paper_filter.must)  # type: ignore[arg-type]
+    if candidate_ids is not None:
+        must.append(FieldCondition(key="id", match=MatchAny(any=candidate_ids)))
+    return must
+
+
+def _unweighted_rrf_query(
+    *,
+    collection_name: str,
+    query: str,
+    limit: int,
+    candidate_ids: list[int] | None = None,
+    paper_filter: Filter | None = None,
+    only_roots: bool = False,
+    fetch_oversample: int = 3,
+) -> list[ScoredPoint]:
+    """One Qdrant query using built-in unweighted RRF fusion of dense+sparse.
+
+    Mirrors the surface of `_weighted_rrf_query` (minus the weights arg) so
+    callers can flip between the two without rebuilding their own filter
+    plumbing. Behavior is identical to the previous inline `query_points(
+    prefetch=[dense, sparse], query=FusionQuery(Fusion.RRF))` pattern.
+    """
+    fetch_limit = max(limit * fetch_oversample, limit)
+    must = _build_must_clauses(
+        paper_filter=paper_filter,
+        candidate_ids=candidate_ids,
+        only_roots=only_roots,
+    )
+    f: Filter | None = Filter(must=must) if must else None
+
+    with RAGalicClient() as client_ctx:
+        client = client_ctx.client
+        dense_model: str = client.embedding_model_name  # type: ignore
+        sparse_model: str = client.sparse_embedding_model_name  # type: ignore
+        return client.query_points(
+            collection_name=collection_name,
+            prefetch=[
+                Prefetch(
+                    query=Document(text=query, model=dense_model),
+                    using="dense",
+                    limit=fetch_limit,
+                    filter=f,
+                ),
+                Prefetch(
+                    query=Document(text=query, model=sparse_model),
+                    using="sparse",
+                    limit=fetch_limit,
+                    filter=f,
+                ),
+            ],
+            query_filter=f,
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=limit,
+        ).points
+
+
 def _weighted_rrf_query(
     *,
     collection_name: str,
@@ -694,13 +706,11 @@ def _weighted_rrf_query(
     dense_w, sparse_w = weights
     fetch_limit = max(limit * fetch_oversample, limit)
 
-    must: list = []
-    if only_roots:
-        must.append(FieldCondition(key="parent_id", match=MatchValue(value=-1)))
-    if paper_filter is not None and paper_filter.must:
-        must.extend(paper_filter.must)  # type: ignore[arg-type]
-    if candidate_ids is not None:
-        must.append(FieldCondition(key="id", match=MatchAny(any=candidate_ids)))
+    must = _build_must_clauses(
+        paper_filter=paper_filter,
+        candidate_ids=candidate_ids,
+        only_roots=only_roots,
+    )
     f: Filter | None = Filter(must=must) if must else None
 
     with RAGalicClient() as client_ctx:
