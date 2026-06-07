@@ -1,3 +1,6 @@
 .env
 __pycache__/
 test*
+!benchmarks/test_metrics.py
+benchmarks/cache/
+rag_lib/qdrant_db/collection/

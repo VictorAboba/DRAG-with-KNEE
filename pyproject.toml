@@ -14,6 +14,17 @@ dependencies = [
     "ruff>=0.15.5",
 ]
 
+[project.optional-dependencies]
+benchmarks = [
+    # datasets >=3 dropped support for dataset-loading scripts, which
+    # allenai/qasper still ships. Pin to the 2.x line.
+    "datasets>=2.20.0,<3.0",
+    "pandas>=2.2.0",
+    "matplotlib>=3.9.0",
+    "scikit-learn>=1.5.0",
+    "tqdm>=4.66.0",
+]
+
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.

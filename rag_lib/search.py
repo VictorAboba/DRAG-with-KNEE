@@ -25,6 +25,8 @@ BEAM_SEARCH_METHODS = Literal[
     "fixed", "adaptive_with_knee", "adaptive_with_sensitive_knee"
 ]
 
+DEFAULT_COLLECTION = "ragalic"
+
 
 def prepare_chunks(points: list[ScoredPoint]) -> list[Chunk]:
     path_to_parsed_files = Path(__file__).parent / "database" / "parsed_files"
@@ -32,16 +34,23 @@ def prepare_chunks(points: list[ScoredPoint]) -> list[Chunk]:
     chunks = []
     for point in points:
         name: str = point.payload["file_name"]
-        path_to_parsed_file = (path_to_parsed_files / name).with_suffix(".json")
         page_start = point.payload["page_start"]
         page_end = point.payload["page_end"]
-        with open(path_to_parsed_file, "r", encoding="utf-8") as file:
-            pages_content = json.load(file)
-            chunk_lines = [f"FILE NAME: {name}"]
-            for i in range(page_start, page_end + 1):
-                chunk_lines.append(f"<-- PAGE {i} -->")
-                chunk_lines.append(pages_content[i])
-        chunk_content = "\n".join(chunk_lines)
+        path_to_parsed_file = (path_to_parsed_files / name).with_suffix(".json")
+
+        if path_to_parsed_file.exists():
+            with open(path_to_parsed_file, "r", encoding="utf-8") as file:
+                pages_content = json.load(file)
+                chunk_lines = [f"FILE NAME: {name}"]
+                for i in range(page_start, page_end + 1):
+                    chunk_lines.append(f"<-- PAGE {i} -->")
+                    chunk_lines.append(pages_content[i])
+            chunk_content = "\n".join(chunk_lines)
+        else:
+            chunk_content = point.payload.get("text") or point.payload.get(
+                "description", ""
+            )
+
         chunk = Chunk(
             file_name=name, page_start=page_start, page_end=page_end, text=chunk_content
         )
@@ -50,18 +59,22 @@ def prepare_chunks(points: list[ScoredPoint]) -> list[Chunk]:
     return chunks
 
 
-def find_roots(query: str, num_to_find: int = 3) -> list[ScoredPoint]:
+def find_roots(
+    query: str,
+    num_to_find: int = 3,
+    collection_name: str = DEFAULT_COLLECTION,
+    extra_filter: Filter | None = None,
+) -> list[ScoredPoint]:
     console.print(f"Finding roots for query: {query[:20]}...", style="bold violet")
     with RAGalicClient() as client:
         dense_model: str = client.client.embedding_model_name  # type: ignore
         sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-        root_filter = Filter(
-            must=[
-                FieldCondition(key="parent_id", match=MatchValue(value=-1)),
-            ]
-        )
+        must = [FieldCondition(key="parent_id", match=MatchValue(value=-1))]
+        if extra_filter is not None and extra_filter.must:
+            must.extend(extra_filter.must)  # type: ignore
+        root_filter = Filter(must=must)
         points = client.client.query_points(  # type: ignore
-            collection_name="ragalic",
+            collection_name=collection_name,
             prefetch=[
                 Prefetch(
                     query=Document(text=query, model=dense_model),
@@ -90,7 +103,11 @@ def find_roots(query: str, num_to_find: int = 3) -> list[ScoredPoint]:
 ##################
 
 
-def parent_vs_children(query: str, parent: ScoredPoint) -> list[ScoredPoint]:
+def parent_vs_children(
+    query: str,
+    parent: ScoredPoint,
+    collection_name: str = DEFAULT_COLLECTION,
+) -> list[ScoredPoint]:
     file_name = parent.payload["file_name"]
     parent_id = parent.payload["id"]
     child_ids = parent.payload["child_ids"]
@@ -116,7 +133,7 @@ def parent_vs_children(query: str, parent: ScoredPoint) -> list[ScoredPoint]:
             must=FieldCondition(key="id", match=MatchAny(any=all_ids))
         )
         sorted_points = client.client.query_points(
-            collection_name="ragalic",
+            collection_name=collection_name,
             prefetch=[
                 Prefetch(
                     query=Document(text=query, model=dense_model),
@@ -153,15 +170,27 @@ def parent_vs_children(query: str, parent: ScoredPoint) -> list[ScoredPoint]:
     return children_better_then_parent
 
 
-def branch_search(query: str, num_roots: int = 3) -> list[Chunk]:
-    roots = find_roots(query=query, num_to_find=num_roots)
+def branch_search_points(
+    query: str,
+    num_roots: int = 3,
+    collection_name: str = DEFAULT_COLLECTION,
+    extra_root_filter: Filter | None = None,
+) -> list[ScoredPoint]:
+    roots = find_roots(
+        query=query,
+        num_to_find=num_roots,
+        collection_name=collection_name,
+        extra_filter=extra_root_filter,
+    )
 
     final_points = []
     points_to_process = roots
     while len(points_to_process) > 0:
         new_point_to_process = []
         for point in points_to_process:
-            new_points = parent_vs_children(query=query, parent=point)
+            new_points = parent_vs_children(
+                query=query, parent=point, collection_name=collection_name
+            )
             if len(new_points) == 0:
                 console.print(
                     f"--- NEW FINAL POINT (id: {point.payload['id']} | file: {point.payload['file_name']} | pages: {point.payload['page_start']} - {point.payload['page_end']}) ---",
@@ -177,7 +206,23 @@ def branch_search(query: str, num_roots: int = 3) -> list[Chunk]:
         style="bold green on white",
     )
 
-    return prepare_chunks(final_points)
+    return final_points
+
+
+def branch_search(
+    query: str,
+    num_roots: int = 3,
+    collection_name: str = DEFAULT_COLLECTION,
+    extra_root_filter: Filter | None = None,
+) -> list[Chunk]:
+    return prepare_chunks(
+        branch_search_points(
+            query=query,
+            num_roots=num_roots,
+            collection_name=collection_name,
+            extra_root_filter=extra_root_filter,
+        )
+    )
 
 
 ##################
@@ -282,6 +327,7 @@ def parents_vs_children(
     width: int = 3,
     search_method: BEAM_SEARCH_METHODS = "fixed",
     sensitivity: float = 0.85,
+    collection_name: str = DEFAULT_COLLECTION,
 ) -> list[ScoredPoint]:
     task_meta = {
         "file_names": [],
@@ -320,7 +366,7 @@ def parents_vs_children(
             must=FieldCondition(key="id", match=MatchAny(any=all_ids))
         )
         sorted_points = client.client.query_points(
-            collection_name="ragalic",
+            collection_name=collection_name,
             prefetch=[
                 Prefetch(
                     query=Document(text=query, model=dense_model),
@@ -398,19 +444,26 @@ def parents_vs_children(
     return new_top_k
 
 
-def beam_search(
+def beam_search_points(
     query: str,
     beam_width: int = 3,
     search_method: BEAM_SEARCH_METHODS = "fixed",
     max_num_roots: int = 20,
     sensitivity: float = 0.5,
-) -> list[Chunk]:
+    collection_name: str = DEFAULT_COLLECTION,
+    extra_root_filter: Filter | None = None,
+) -> list[ScoredPoint]:
     if search_method == "fixed":
         console.print(
             f"Running BEAM SEARCH with [underline]FIXED[/underline] width: {beam_width}",
             style="bold cyan",
         )
-        old_points = find_roots(query=query, num_to_find=beam_width)
+        old_points = find_roots(
+            query=query,
+            num_to_find=beam_width,
+            collection_name=collection_name,
+            extra_filter=extra_root_filter,
+        )
     elif (
         search_method == "adaptive_with_knee"
         or search_method == "adaptive_with_sensitive_knee"
@@ -426,20 +479,24 @@ def beam_search(
                 style="bold cyan",
             )
         with RAGalicClient() as client:
-            root_filter = Filter(
-                must=[
-                    FieldCondition(key="parent_id", match=MatchValue(value=-1)),
-                ]
-            )
+            must = [FieldCondition(key="parent_id", match=MatchValue(value=-1))]
+            if extra_root_filter is not None and extra_root_filter.must:
+                must.extend(extra_root_filter.must)  # type: ignore
+            root_filter = Filter(must=must)
             all_root_points_num = client.client.count(
-                collection_name="ragalic", count_filter=root_filter
+                collection_name=collection_name, count_filter=root_filter
             ).count
             all_root_points_num = min(all_root_points_num, max_num_roots)
         console.print(
             f"Total root points available: {all_root_points_num}",
             style="italic bright_black",
         )
-        old_points = find_roots(query=query, num_to_find=all_root_points_num)
+        old_points = find_roots(
+            query=query,
+            num_to_find=all_root_points_num,
+            collection_name=collection_name,
+            extra_filter=extra_root_filter,
+        )
         console.print(
             f"Initial root points retrieved: {len(old_points)}",
             style="italic bright_black",
@@ -468,6 +525,7 @@ def beam_search(
             width=beam_width,
             search_method=search_method,
             sensitivity=sensitivity,
+            collection_name=collection_name,
         )
         old_points = new_points
         new_ids = [point.payload["id"] for point in new_points]
@@ -477,7 +535,29 @@ def beam_search(
         style="bold green on white",
     )
 
-    return prepare_chunks(new_points)
+    return new_points
+
+
+def beam_search(
+    query: str,
+    beam_width: int = 3,
+    search_method: BEAM_SEARCH_METHODS = "fixed",
+    max_num_roots: int = 20,
+    sensitivity: float = 0.5,
+    collection_name: str = DEFAULT_COLLECTION,
+    extra_root_filter: Filter | None = None,
+) -> list[Chunk]:
+    return prepare_chunks(
+        beam_search_points(
+            query=query,
+            beam_width=beam_width,
+            search_method=search_method,
+            max_num_roots=max_num_roots,
+            sensitivity=sensitivity,
+            collection_name=collection_name,
+            extra_root_filter=extra_root_filter,
+        )
+    )
 
 
 if __name__ == "__main__":

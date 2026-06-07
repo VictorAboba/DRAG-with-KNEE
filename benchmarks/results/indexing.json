@@ -1,0 +1,14 @@
+{
+  "bench_drag": {
+    "leaves": 216,
+    "parent_nodes": 108,
+    "llm_calls": 324,
+    "seconds": 2005.3146135999996
+  },
+  "bench_raptor": {
+    "leaves": 216,
+    "parent_nodes": 15,
+    "llm_calls": 15,
+    "seconds": 1002.8690429999988
+  }
+}

@@ -52,7 +52,12 @@ PATH_TO_PARSED_DOCS.mkdir(511, parents=True, exist_ok=True)
 console = Console()
 
 
-def build_tree(path: Path, width: int = 3, batch_size: int = 5):
+def build_tree(
+    path: Path,
+    width: int = 3,
+    batch_size: int = 5,
+    collection_name: str = "ragalic",
+):
     name = path.name
     console.print(f"Building tree for: {name}", style="bold black on white")
     chunks = chunk_document(path)
@@ -67,21 +72,21 @@ def build_tree(path: Path, width: int = 3, batch_size: int = 5):
         json.dump([""] + chunks, f, ensure_ascii=False, indent=4)
 
     with RAGalicClient() as client:
-        if not client.client.collection_exists("ragalic"):
+        if not client.client.collection_exists(collection_name):
             client.client.create_collection(
-                collection_name="ragalic",
+                collection_name=collection_name,
                 vectors_config={
                     "dense": list(client.client.get_fastembed_vector_params().items())[
                         0
                     ][1]
-                },  # Конфиг для Dense
+                },
                 sparse_vectors_config={
                     "sparse": list(
                         client.client.get_fastembed_sparse_vector_params().items()
                     )[0][1]
-                },  # Конфиг для Sparse
+                },
             )
-        cur_id = client.client.count("ragalic").count
+        cur_id = client.client.count(collection_name).count
 
     nodes: list[Node] = []
     for i, chunk in enumerate(chunks, start=1):
@@ -262,7 +267,7 @@ def build_tree(path: Path, width: int = 3, batch_size: int = 5):
                 for node in batch
             ]
             client.client.upsert(
-                collection_name="ragalic",
+                collection_name=collection_name,
                 points=points,
                 wait=True,
             )
