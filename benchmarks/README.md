@@ -10,14 +10,28 @@ Compares the DRAG-with-KNEE retrievers against four baselines on QASPER
 | `vanilla_dense` | `bench_flat` | none | no | `jina-v3` cosine, top-k over leaves |
 | `bm25_only` | `bench_flat` | none | no | Sparse BM25 only |
 | `hybrid_rrf_flat` | `bench_flat` | none | no | Dense + BM25 fused via RRF |
+| `hyde_hybrid` | `bench_flat` | none | no | HyDE (Gao et al. 2022): LLM writes a hypothetical answer, dense side embeds that |
 | `raptor_collapsed` | `bench_raptor` | GMM clustering | no | RAPTOR-style cluster summaries, collapsed-tree retrieval |
 | `drag_branch` | `bench_drag` | structural | yes | Existing `branch_search` |
 | `drag_beam_fixed` | `bench_drag` | structural | no | `beam_search(method="fixed")` |
 | `drag_beam_knee` | `bench_drag` | structural | yes | `beam_search(method="adaptive_with_knee")` |
 | `drag_beam_sensitive_knee` | `bench_drag` | structural | yes | `beam_search(method="adaptive_with_sensitive_knee", sensitivity=0.85)` |
+| `drag_beam_sensk_0.25` | `bench_drag` | structural | yes | sensitive_knee at 0.25 |
+| `drag_beam_sensk_0.5` | `bench_drag` | structural | yes | sensitive_knee at 0.5 |
+| `drag_beam_sensk_0.75` | `bench_drag` | structural | yes | sensitive_knee at 0.75 |
+| `drag_beam_scheduled` | `bench_drag` | structural | no | Per-step weighted RRF: BM25 at root, dense at leaves |
 
 Three Qdrant collections share the same QASPER paragraphs as leaves so retrievers
 see identical data; only the index *shape* differs.
+
+## Two orthogonal flags
+
+| Flag | What it changes | Why |
+|---|---|---|
+| `--cross-paper` | Drops the per-paper filter so every query searches across all indexed papers | Lets DRAG's root-level knee actually pick which document(s) matter. Without this each QASPER question is scoped to its source paper and the root-level knee operates on a 1-point distribution. |
+| `--weight-schedule` | Every DRAG method uses a per-step BM25→semantic schedule instead of unweighted RRF | Hypothesis: BM25 keyword matching identifies the right topic/document at root level; dense embeddings identify the right fact at leaf level. Schedule is `(0.2, 0.8) → (0.5, 0.5) → (0.8, 0.2) → (1.0, 0.0)` (dense_w, sparse_w). Flat retrievers and RAPTOR silently ignore this flag. |
+
+The two flags compose — `--cross-paper --weight-schedule` is the most aggressive setting and the most informative single experiment for DRAG.
 
 ## Metrics
 
