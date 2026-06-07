@@ -115,6 +115,7 @@ def _run_retrieval(args, questions, retriever_names: list[str]) -> list[dict]:
     raw_rows: list[dict] = []
     total = len(questions) * len(retriever_names)
     done = 0
+    cross_paper = getattr(args, "cross_paper", False)
     for retriever in retriever_names:
         fn = RETRIEVERS[retriever]
         coll = collection_for(retriever)  # type: ignore[arg-type]
@@ -123,7 +124,7 @@ def _run_retrieval(args, questions, retriever_names: list[str]) -> list[dict]:
             try:
                 res = fn(
                     query=q.text,
-                    paper_id=q.paper_id,
+                    paper_id=None if cross_paper else q.paper_id,
                     k=args.k,
                     collection_name=coll,
                 )
@@ -307,6 +308,15 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=list(RETRIEVERS.keys()),
         choices=list(RETRIEVERS.keys()),
+    )
+    p.add_argument(
+        "--cross-paper",
+        action="store_true",
+        help=(
+            "Search across ALL indexed papers per query (no per-paper filter). "
+            "Lets DRAG's root-level knee actually pick documents. Without this "
+            "flag each query is scoped to its source paper."
+        ),
     )
     p.add_argument("--smoke", action="store_true", help="Tiny config for end-to-end pipeline verification")
     return p.parse_args()

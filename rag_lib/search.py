@@ -560,6 +560,196 @@ def beam_search(
     )
 
 
+##################
+# SCHEDULED-FUSION BEAM SEARCH
+# ──────────────────────────────────────────────────────────────────────────
+# Hypothesis: at the document/section level (root, near-root), keyword
+# matching (BM25) is the right signal for "which topic is this?"; at the
+# leaf level, dense embeddings are the right signal for "which fact in
+# this topic?". We expose a per-step weight schedule between dense and
+# sparse, fused with weighted RRF in Python (Qdrant's built-in fusion has
+# no weight knob).
+##################
+
+
+def _weighted_rrf_query(
+    *,
+    collection_name: str,
+    query: str,
+    weights: tuple[float, float],
+    limit: int,
+    candidate_ids: list[int] | None = None,
+    paper_filter: Filter | None = None,
+    only_roots: bool = False,
+    fetch_oversample: int = 3,
+    rrf_k: int = 60,
+) -> list[ScoredPoint]:
+    """One query against the dense and sparse vectors, fused with weighted RRF.
+
+    weights is (dense_weight, sparse_weight). Either may be 0 to skip that
+    side entirely. Returns up to `limit` ScoredPoints sorted by the combined
+    score, with `.score` overwritten to the weighted-RRF value.
+    """
+    dense_w, sparse_w = weights
+    fetch_limit = max(limit * fetch_oversample, limit)
+
+    must: list = []
+    if only_roots:
+        must.append(FieldCondition(key="parent_id", match=MatchValue(value=-1)))
+    if paper_filter is not None and paper_filter.must:
+        must.extend(paper_filter.must)  # type: ignore[arg-type]
+    if candidate_ids is not None:
+        must.append(FieldCondition(key="id", match=MatchAny(any=candidate_ids)))
+    f: Filter | None = Filter(must=must) if must else None
+
+    with RAGalicClient() as client_ctx:
+        client = client_ctx.client
+        dense_model: str = client.embedding_model_name  # type: ignore
+        sparse_model: str = client.sparse_embedding_model_name  # type: ignore
+
+        dense_points: list[ScoredPoint] = []
+        if dense_w > 0:
+            dense_points = client.query_points(
+                collection_name=collection_name,
+                query=Document(text=query, model=dense_model),
+                using="dense",
+                query_filter=f,
+                limit=fetch_limit,
+            ).points
+
+        sparse_points: list[ScoredPoint] = []
+        if sparse_w > 0:
+            sparse_points = client.query_points(
+                collection_name=collection_name,
+                query=Document(text=query, model=sparse_model),
+                using="sparse",
+                query_filter=f,
+                limit=fetch_limit,
+            ).points
+
+    id_to_point: dict[int, ScoredPoint] = {}
+    scores: dict[int, float] = {}
+    for rank, p in enumerate(dense_points, 1):
+        pid = p.payload["id"]
+        id_to_point[pid] = p
+        scores[pid] = scores.get(pid, 0.0) + dense_w / (rrf_k + rank)
+    for rank, p in enumerate(sparse_points, 1):
+        pid = p.payload["id"]
+        if pid not in id_to_point:
+            id_to_point[pid] = p
+        scores[pid] = scores.get(pid, 0.0) + sparse_w / (rrf_k + rank)
+
+    sorted_ids = sorted(scores.keys(), key=lambda i: -scores[i])
+    out: list[ScoredPoint] = []
+    for pid in sorted_ids[:limit]:
+        p = id_to_point[pid]
+        try:
+            p.score = scores[pid]  # mutate so downstream sees the fused score
+        except Exception:
+            pass
+        out.append(p)
+    return out
+
+
+def beam_search_points_scheduled(
+    query: str,
+    schedule: list[tuple[float, float]],
+    beam_width: int = 3,
+    collection_name: str = DEFAULT_COLLECTION,
+    extra_root_filter: Filter | None = None,
+    max_iter: int = 8,
+) -> list[ScoredPoint]:
+    """Fixed-width beam search with per-step (dense, sparse) RRF weights.
+
+    `schedule[i]` is the weight pair used at iteration i. The last entry is
+    re-used for any iteration beyond `len(schedule) - 1`. The expansion logic
+    (parent-vs-child suppression) is identical to `beam_search_points`; only
+    the candidate scoring differs.
+    """
+    console.print(
+        f"Running BEAM SEARCH with [underline]SCHEDULED FUSION[/underline] "
+        f"width={beam_width} schedule={schedule}",
+        style="bold cyan",
+    )
+
+    weights_root = schedule[0]
+    old_points = _weighted_rrf_query(
+        collection_name=collection_name,
+        query=query,
+        weights=weights_root,
+        limit=beam_width,
+        paper_filter=extra_root_filter,
+        only_roots=True,
+    )
+
+    old_ids: list = [p.payload["id"] for p in old_points]
+    new_ids: list = []
+    step = 1
+    new_points: list[ScoredPoint] = list(old_points)
+
+    while not check_ids(old_ids=old_ids, new_ids=new_ids) and step <= max_iter:
+        weights = schedule[min(step, len(schedule) - 1)]
+        old_ids = [p.payload["id"] for p in old_points]
+
+        parent_ids = list({p.payload["id"] for p in old_points})
+        child_ids_set: set[int] = set()
+        for p in old_points:
+            for cid in p.payload.get("child_ids", []) or []:
+                child_ids_set.add(cid)
+        child_ids = list(child_ids_set)
+
+        if not child_ids:
+            console.print(
+                f"[scheduled] step {step}: all current beam members are leaves",
+                style="italic bright_black",
+            )
+            new_points = list(old_points)
+            break
+
+        all_candidate_ids = parent_ids + child_ids
+        console.print(
+            f"[scheduled] step {step}: weights={weights} "
+            f"parents={len(parent_ids)} children={len(child_ids)}",
+            style="italic bright_black",
+        )
+
+        sorted_points = _weighted_rrf_query(
+            collection_name=collection_name,
+            query=query,
+            weights=weights,
+            limit=len(all_candidate_ids),
+            candidate_ids=all_candidate_ids,
+        )
+
+        children_to_eliminate: list[int] = []
+        parents_to_eliminate: list = []
+        new_top_k: list[ScoredPoint] = []
+        for point in sorted_points:
+            p_id = point.payload["id"]
+            if p_id in child_ids and p_id not in children_to_eliminate:
+                parents_to_eliminate.append(point.payload.get("parent_id"))
+                new_top_k.append(point)
+            elif p_id in parent_ids and p_id not in parents_to_eliminate:
+                children_to_eliminate.extend(
+                    point.payload.get("child_ids", []) or []
+                )
+                new_top_k.append(point)
+            if len(new_top_k) >= beam_width:
+                break
+
+        old_points = new_top_k
+        new_points = new_top_k
+        new_ids = [p.payload["id"] for p in new_points]
+        step += 1
+
+    console.print(
+        f"--- SCHEDULED BEAM SEARCH found {len(new_points)} POINTS "
+        f"after {step - 1} step(s) for query: '{query[:20]}...' ---",
+        style="bold green on white",
+    )
+    return new_points
+
+
 if __name__ == "__main__":
     test_query = "Which laws are administered by the Registrar and what are their respective citation titles?"
     branch_search(query=test_query)
