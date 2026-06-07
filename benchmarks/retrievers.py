@@ -37,8 +37,15 @@ from rag_lib.clients import RAGalicClient
 from rag_lib.search import (
     branch_search_points,
     beam_search_points,
+    DEFAULT_FUSION_SCHEDULE,
 )
 from rag_lib.utils import llm_call
+
+
+def _schedule_or_none(weight_schedule: bool) -> list[tuple[float, float]] | None:
+    """Translate the user-facing boolean flag into the actual schedule list
+    that the search-layer functions expect."""
+    return DEFAULT_FUSION_SCHEDULE if weight_schedule else None
 
 RetrieverName = Literal[
     "vanilla_dense",
@@ -149,7 +156,7 @@ def _points_to_paragraph_ids(points: list[ScoredPoint]) -> list[str]:
 
 
 def retrieve_vanilla_dense(
-    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat"
+    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat", **_kw
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = _flat_query(query, paper_id, k, "dense", collection_name)
@@ -165,7 +172,7 @@ def retrieve_vanilla_dense(
 
 
 def retrieve_bm25_only(
-    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat"
+    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat", **_kw
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = _flat_query(query, paper_id, k, "sparse", collection_name)
@@ -181,7 +188,7 @@ def retrieve_bm25_only(
 
 
 def retrieve_hybrid_rrf_flat(
-    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat"
+    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat", **_kw
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = _flat_query(query, paper_id, k, "hybrid", collection_name)
@@ -279,6 +286,8 @@ def retrieve_drag_branch(
     k: int,  # ignored — branch_search picks its own depth
     collection_name: str = "bench_drag",
     num_roots: int = 3,
+    weight_schedule: bool = False,
+    **_kw,
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = branch_search_points(
@@ -286,6 +295,7 @@ def retrieve_drag_branch(
         num_roots=num_roots,
         collection_name=collection_name,
         extra_root_filter=_paper_filter(paper_id),
+        schedule=_schedule_or_none(weight_schedule),
     )
     elapsed = time.perf_counter() - t0
     pids = _drag_points_to_paragraph_ids(collection_name, paper_id, points)
@@ -303,6 +313,8 @@ def retrieve_drag_beam_fixed(
     paper_id: str | None,
     k: int,
     collection_name: str = "bench_drag",
+    weight_schedule: bool = False,
+    **_kw,
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = beam_search_points(
@@ -311,6 +323,7 @@ def retrieve_drag_beam_fixed(
         search_method="fixed",
         collection_name=collection_name,
         extra_root_filter=_paper_filter(paper_id),
+        schedule=_schedule_or_none(weight_schedule),
     )
     elapsed = time.perf_counter() - t0
     pids = _drag_points_to_paragraph_ids(collection_name, paper_id, points)
@@ -329,6 +342,8 @@ def retrieve_drag_beam_knee(
     k: int,  # ignored — knee picks adaptively
     collection_name: str = "bench_drag",
     max_num_roots: int = 20,
+    weight_schedule: bool = False,
+    **_kw,
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = beam_search_points(
@@ -337,6 +352,7 @@ def retrieve_drag_beam_knee(
         max_num_roots=max_num_roots,
         collection_name=collection_name,
         extra_root_filter=_paper_filter(paper_id),
+        schedule=_schedule_or_none(weight_schedule),
     )
     elapsed = time.perf_counter() - t0
     pids = _drag_points_to_paragraph_ids(collection_name, paper_id, points)
@@ -356,6 +372,8 @@ def retrieve_drag_beam_sensitive_knee(
     collection_name: str = "bench_drag",
     sensitivity: float = 0.85,
     max_num_roots: int = 20,
+    weight_schedule: bool = False,
+    **_kw,
 ) -> RetrievalResult:
     t0 = time.perf_counter()
     points = beam_search_points(
@@ -365,6 +383,7 @@ def retrieve_drag_beam_sensitive_knee(
         max_num_roots=max_num_roots,
         collection_name=collection_name,
         extra_root_filter=_paper_filter(paper_id),
+        schedule=_schedule_or_none(weight_schedule),
     )
     elapsed = time.perf_counter() - t0
     pids = _drag_points_to_paragraph_ids(collection_name, paper_id, points)
@@ -383,7 +402,7 @@ def retrieve_drag_beam_sensitive_knee(
 
 
 def retrieve_raptor_collapsed(
-    query: str, paper_id: str | None, k: int, collection_name: str = "bench_raptor"
+    query: str, paper_id: str | None, k: int, collection_name: str = "bench_raptor", **_kw
 ) -> RetrievalResult:
     """RAPTOR's 'collapsed tree' retrieval: rank all nodes (leaves + cluster
     summaries) jointly by hybrid score, then return the top-k, expanded to
@@ -462,7 +481,7 @@ def _generate_hyde(query: str) -> str:
 
 
 def retrieve_hyde_hybrid(
-    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat"
+    query: str, paper_id: str | None, k: int, collection_name: str = "bench_flat", **_kw
 ) -> RetrievalResult:
     """HyDE + hybrid RRF: dense side embeds the hypothetical answer, sparse
     side keeps the raw query (BM25 needs the actual query keywords)."""
@@ -500,6 +519,8 @@ def _make_sensk_retriever(sensitivity: float, name: str):
         k: int,
         collection_name: str = "bench_drag",
         max_num_roots: int = 20,
+        weight_schedule: bool = False,
+        **_kw,
     ) -> RetrievalResult:
         t0 = time.perf_counter()
         points = beam_search_points(
@@ -509,6 +530,7 @@ def _make_sensk_retriever(sensitivity: float, name: str):
             max_num_roots=max_num_roots,
             collection_name=collection_name,
             extra_root_filter=_paper_filter(paper_id),
+            schedule=_schedule_or_none(weight_schedule),
         )
         elapsed = time.perf_counter() - t0
         pids = _drag_points_to_paragraph_ids(collection_name, paper_id, points)
@@ -539,6 +561,8 @@ def retrieve_drag_beam_scheduled(
     paper_id: str | None,
     k: int,
     collection_name: str = "bench_drag",
+    weight_schedule: bool = True,  # this retriever is the schedule by definition
+    **_kw,
 ) -> RetrievalResult:
     """Hypothesis: at the document/section level (early beam steps), BM25
     keyword matching identifies the right topic; at the leaf level (late

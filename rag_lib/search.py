@@ -27,6 +27,28 @@ BEAM_SEARCH_METHODS = Literal[
 
 DEFAULT_COLLECTION = "ragalic"
 
+# Default per-step fusion weights for the "weight schedule" mode.
+# Step 0 = root level (lean on BM25 keywords to pick the right document);
+# step N = leaf level (lean on dense embeddings to pick the right fact).
+# Entries are (dense_weight, sparse_weight). The last entry is reused for any
+# step beyond len(schedule)-1.
+DEFAULT_FUSION_SCHEDULE: list[tuple[float, float]] = [
+    (0.2, 0.8),
+    (0.5, 0.5),
+    (0.8, 0.2),
+    (1.0, 0.0),
+]
+
+
+def _weights_for_step(
+    schedule: list[tuple[float, float]] | None, step: int
+) -> tuple[float, float] | None:
+    if schedule is None:
+        return None
+    if not schedule:
+        return None
+    return schedule[min(step, len(schedule) - 1)]
+
 
 def prepare_chunks(points: list[ScoredPoint]) -> list[Chunk]:
     path_to_parsed_files = Path(__file__).parent / "database" / "parsed_files"
@@ -64,35 +86,60 @@ def find_roots(
     num_to_find: int = 3,
     collection_name: str = DEFAULT_COLLECTION,
     extra_filter: Filter | None = None,
+    schedule: list[tuple[float, float]] | None = None,
+    step: int = 0,
 ) -> list[ScoredPoint]:
+    """Find root nodes for the query.
+
+    When `schedule` is None: use Qdrant's built-in unweighted RRF (unchanged
+    behavior). When `schedule` is provided: use weighted RRF with the
+    schedule[step] weights — lets the caller bias toward BM25 keyword match
+    at the root level and dense semantics deeper in the tree.
+    """
     console.print(f"Finding roots for query: {query[:20]}...", style="bold violet")
-    with RAGalicClient() as client:
-        dense_model: str = client.client.embedding_model_name  # type: ignore
-        sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-        must = [FieldCondition(key="parent_id", match=MatchValue(value=-1))]
-        if extra_filter is not None and extra_filter.must:
-            must.extend(extra_filter.must)  # type: ignore
-        root_filter = Filter(must=must)
-        points = client.client.query_points(  # type: ignore
+    weights = _weights_for_step(schedule, step)
+
+    if weights is not None:
+        console.print(
+            f"[find_roots] weighted RRF step={step} weights={weights}",
+            style="italic bright_black",
+        )
+        points = _weighted_rrf_query(
             collection_name=collection_name,
-            prefetch=[
-                Prefetch(
-                    query=Document(text=query, model=dense_model),
-                    using="dense",
-                    limit=num_to_find * 3,
-                    filter=root_filter,
-                ),
-                Prefetch(
-                    query=Document(text=query, model=sparse_model),
-                    using="sparse",
-                    limit=num_to_find * 3,
-                    filter=root_filter,
-                ),
-            ],
-            query_filter=root_filter,
-            query=FusionQuery(fusion=Fusion.RRF),
+            query=query,
+            weights=weights,
             limit=num_to_find,
-        ).points
+            paper_filter=extra_filter,
+            only_roots=True,
+        )
+    else:
+        with RAGalicClient() as client:
+            dense_model: str = client.client.embedding_model_name  # type: ignore
+            sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
+            must = [FieldCondition(key="parent_id", match=MatchValue(value=-1))]
+            if extra_filter is not None and extra_filter.must:
+                must.extend(extra_filter.must)  # type: ignore
+            root_filter = Filter(must=must)
+            points = client.client.query_points(  # type: ignore
+                collection_name=collection_name,
+                prefetch=[
+                    Prefetch(
+                        query=Document(text=query, model=dense_model),
+                        using="dense",
+                        limit=num_to_find * 3,
+                        filter=root_filter,
+                    ),
+                    Prefetch(
+                        query=Document(text=query, model=sparse_model),
+                        using="sparse",
+                        limit=num_to_find * 3,
+                        filter=root_filter,
+                    ),
+                ],
+                query_filter=root_filter,
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=num_to_find,
+            ).points
     names = [f"{point.payload['file_name']}" for point in points]
     console.print(f"Found roots of files: {names}", style="italic purple")
     return points
@@ -107,6 +154,8 @@ def parent_vs_children(
     query: str,
     parent: ScoredPoint,
     collection_name: str = DEFAULT_COLLECTION,
+    schedule: list[tuple[float, float]] | None = None,
+    step: int = 1,
 ) -> list[ScoredPoint]:
     file_name = parent.payload["file_name"]
     parent_id = parent.payload["id"]
@@ -126,32 +175,46 @@ def parent_vs_children(
         style="bold violet",
     )
 
-    with RAGalicClient() as client:
-        dense_model: str = client.client.embedding_model_name  # type: ignore
-        sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-        children_and_parent_filter = Filter(
-            must=FieldCondition(key="id", match=MatchAny(any=all_ids))
+    weights = _weights_for_step(schedule, step)
+    if weights is not None:
+        console.print(
+            f"[parent_vs_children] weighted RRF step={step} weights={weights}",
+            style="italic bright_black",
         )
-        sorted_points = client.client.query_points(
+        sorted_points = _weighted_rrf_query(
             collection_name=collection_name,
-            prefetch=[
-                Prefetch(
-                    query=Document(text=query, model=dense_model),
-                    using="dense",
-                    limit=len(all_ids),
-                    filter=children_and_parent_filter,
-                ),
-                Prefetch(
-                    query=Document(text=query, model=sparse_model),
-                    using="sparse",
-                    limit=len(all_ids),
-                    filter=children_and_parent_filter,
-                ),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            query_filter=children_and_parent_filter,
+            query=query,
+            weights=weights,
             limit=len(all_ids),
-        ).points
+            candidate_ids=all_ids,
+        )
+    else:
+        with RAGalicClient() as client:
+            dense_model: str = client.client.embedding_model_name  # type: ignore
+            sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
+            children_and_parent_filter = Filter(
+                must=FieldCondition(key="id", match=MatchAny(any=all_ids))
+            )
+            sorted_points = client.client.query_points(
+                collection_name=collection_name,
+                prefetch=[
+                    Prefetch(
+                        query=Document(text=query, model=dense_model),
+                        using="dense",
+                        limit=len(all_ids),
+                        filter=children_and_parent_filter,
+                    ),
+                    Prefetch(
+                        query=Document(text=query, model=sparse_model),
+                        using="sparse",
+                        limit=len(all_ids),
+                        filter=children_and_parent_filter,
+                    ),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                query_filter=children_and_parent_filter,
+                limit=len(all_ids),
+            ).points
 
     children_better_then_parent = []
     for point in sorted_points:
@@ -175,21 +238,29 @@ def branch_search_points(
     num_roots: int = 3,
     collection_name: str = DEFAULT_COLLECTION,
     extra_root_filter: Filter | None = None,
+    schedule: list[tuple[float, float]] | None = None,
 ) -> list[ScoredPoint]:
     roots = find_roots(
         query=query,
         num_to_find=num_roots,
         collection_name=collection_name,
         extra_filter=extra_root_filter,
+        schedule=schedule,
+        step=0,
     )
 
     final_points = []
     points_to_process = roots
+    step = 1
     while len(points_to_process) > 0:
         new_point_to_process = []
         for point in points_to_process:
             new_points = parent_vs_children(
-                query=query, parent=point, collection_name=collection_name
+                query=query,
+                parent=point,
+                collection_name=collection_name,
+                schedule=schedule,
+                step=step,
             )
             if len(new_points) == 0:
                 console.print(
@@ -200,6 +271,7 @@ def branch_search_points(
             else:
                 new_point_to_process.extend(new_points)
         points_to_process = new_point_to_process
+        step += 1
 
     console.print(
         f"--- WAS FOUND {len(final_points)} POINTS FOR QUERY: '{query[:20]}...' ---",
@@ -214,6 +286,7 @@ def branch_search(
     num_roots: int = 3,
     collection_name: str = DEFAULT_COLLECTION,
     extra_root_filter: Filter | None = None,
+    schedule: list[tuple[float, float]] | None = None,
 ) -> list[Chunk]:
     return prepare_chunks(
         branch_search_points(
@@ -221,6 +294,7 @@ def branch_search(
             num_roots=num_roots,
             collection_name=collection_name,
             extra_root_filter=extra_root_filter,
+            schedule=schedule,
         )
     )
 
@@ -328,6 +402,8 @@ def parents_vs_children(
     search_method: BEAM_SEARCH_METHODS = "fixed",
     sensitivity: float = 0.85,
     collection_name: str = DEFAULT_COLLECTION,
+    schedule: list[tuple[float, float]] | None = None,
+    step: int = 1,
 ) -> list[ScoredPoint]:
     task_meta = {
         "file_names": [],
@@ -359,32 +435,46 @@ def parents_vs_children(
     )
     all_ids = task_meta["parent_ids"] + task_meta["child_ids"]
 
-    with RAGalicClient() as client:
-        dense_model: str = client.client.embedding_model_name  # type: ignore
-        sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
-        all_vs_all_filter = Filter(
-            must=FieldCondition(key="id", match=MatchAny(any=all_ids))
+    weights = _weights_for_step(schedule, step)
+    if weights is not None:
+        console.print(
+            f"[parents_vs_children] weighted RRF step={step} weights={weights}",
+            style="italic bright_black",
         )
-        sorted_points = client.client.query_points(
+        sorted_points = _weighted_rrf_query(
             collection_name=collection_name,
-            prefetch=[
-                Prefetch(
-                    query=Document(text=query, model=dense_model),
-                    using="dense",
-                    limit=len(all_ids),
-                    filter=all_vs_all_filter,
-                ),
-                Prefetch(
-                    query=Document(text=query, model=sparse_model),
-                    using="sparse",
-                    limit=len(all_ids),
-                    filter=all_vs_all_filter,
-                ),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            query_filter=all_vs_all_filter,
+            query=query,
+            weights=weights,
             limit=len(all_ids),
-        ).points
+            candidate_ids=all_ids,
+        )
+    else:
+        with RAGalicClient() as client:
+            dense_model: str = client.client.embedding_model_name  # type: ignore
+            sparse_model: str = client.client.sparse_embedding_model_name  # type: ignore
+            all_vs_all_filter = Filter(
+                must=FieldCondition(key="id", match=MatchAny(any=all_ids))
+            )
+            sorted_points = client.client.query_points(
+                collection_name=collection_name,
+                prefetch=[
+                    Prefetch(
+                        query=Document(text=query, model=dense_model),
+                        using="dense",
+                        limit=len(all_ids),
+                        filter=all_vs_all_filter,
+                    ),
+                    Prefetch(
+                        query=Document(text=query, model=sparse_model),
+                        using="sparse",
+                        limit=len(all_ids),
+                        filter=all_vs_all_filter,
+                    ),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                query_filter=all_vs_all_filter,
+                limit=len(all_ids),
+            ).points
 
     children_to_eliminate = []
     parents_to_eliminate = []
@@ -452,6 +542,7 @@ def beam_search_points(
     sensitivity: float = 0.5,
     collection_name: str = DEFAULT_COLLECTION,
     extra_root_filter: Filter | None = None,
+    schedule: list[tuple[float, float]] | None = None,
 ) -> list[ScoredPoint]:
     if search_method == "fixed":
         console.print(
@@ -463,6 +554,8 @@ def beam_search_points(
             num_to_find=beam_width,
             collection_name=collection_name,
             extra_filter=extra_root_filter,
+            schedule=schedule,
+            step=0,
         )
     elif (
         search_method == "adaptive_with_knee"
@@ -496,6 +589,8 @@ def beam_search_points(
             num_to_find=all_root_points_num,
             collection_name=collection_name,
             extra_filter=extra_root_filter,
+            schedule=schedule,
+            step=0,
         )
         console.print(
             f"Initial root points retrieved: {len(old_points)}",
@@ -517,6 +612,7 @@ def beam_search_points(
 
     old_ids = [point.payload["id"] for point in old_points]
     new_ids = []
+    step = 1
     while not check_ids(old_ids=old_ids, new_ids=new_ids):
         old_ids = [point.payload["id"] for point in old_points]
         new_points = parents_vs_children(
@@ -526,9 +622,12 @@ def beam_search_points(
             search_method=search_method,
             sensitivity=sensitivity,
             collection_name=collection_name,
+            schedule=schedule,
+            step=step,
         )
         old_points = new_points
         new_ids = [point.payload["id"] for point in new_points]
+        step += 1
 
     console.print(
         f"--- WAS FOUND {len(new_points)} POINTS FOR QUERY: '{query[:20]}...' ---",
@@ -546,6 +645,7 @@ def beam_search(
     sensitivity: float = 0.5,
     collection_name: str = DEFAULT_COLLECTION,
     extra_root_filter: Filter | None = None,
+    schedule: list[tuple[float, float]] | None = None,
 ) -> list[Chunk]:
     return prepare_chunks(
         beam_search_points(
@@ -556,6 +656,7 @@ def beam_search(
             sensitivity=sensitivity,
             collection_name=collection_name,
             extra_root_filter=extra_root_filter,
+            schedule=schedule,
         )
     )
 

@@ -116,6 +116,7 @@ def _run_retrieval(args, questions, retriever_names: list[str]) -> list[dict]:
     total = len(questions) * len(retriever_names)
     done = 0
     cross_paper = getattr(args, "cross_paper", False)
+    weight_schedule = getattr(args, "weight_schedule", False)
     for retriever in retriever_names:
         fn = RETRIEVERS[retriever]
         coll = collection_for(retriever)  # type: ignore[arg-type]
@@ -127,6 +128,7 @@ def _run_retrieval(args, questions, retriever_names: list[str]) -> list[dict]:
                     paper_id=None if cross_paper else q.paper_id,
                     k=args.k,
                     collection_name=coll,
+                    weight_schedule=weight_schedule,
                 )
                 err = None
             except Exception as exc:
@@ -316,6 +318,17 @@ def parse_args() -> argparse.Namespace:
             "Search across ALL indexed papers per query (no per-paper filter). "
             "Lets DRAG's root-level knee actually pick documents. Without this "
             "flag each query is scoped to its source paper."
+        ),
+    )
+    p.add_argument(
+        "--weight-schedule",
+        action="store_true",
+        help=(
+            "Use the BM25→semantic per-step fusion schedule for every DRAG "
+            "method (find_roots / parent_vs_children / parents_vs_children). "
+            "When unset, all DRAG methods use Qdrant's unweighted RRF as before. "
+            "Flat retrievers (vanilla, BM25, hybrid, HyDE) and RAPTOR ignore this "
+            "flag — they don't have a multi-step tree to schedule over."
         ),
     )
     p.add_argument("--smoke", action="store_true", help="Tiny config for end-to-end pipeline verification")
