@@ -31,9 +31,11 @@ from rag_lib.utils import llm_call
 from .datasets import load_qasper_slice, load_slice, save_slice
 from .indexing import (
     drop_collection,
+    existing_paper_ids,
     index_drag_tree,
     index_flat_leaves,
     index_raptor_tree,
+    max_existing_node_id,
 )
 from .metrics import aggregate, per_query_metrics
 from .retrievers import (
@@ -73,8 +75,24 @@ def _ensure_slice(args) -> Path:
     return slice_dir
 
 
+def _incremental_state(collection_name: str) -> tuple[set[str], int]:
+    """Return (paper_ids already present, next safe node-id start) for a collection.
+
+    On a missing collection: empty set, 0. Used only when --incremental is set.
+    """
+    existing = existing_paper_ids(collection_name)
+    next_id = max_existing_node_id(collection_name) + 1
+    if existing:
+        print(
+            f"[runner]   {collection_name}: {len(existing)} paper(s) already "
+            f"indexed (next node_id={next_id})"
+        )
+    return existing, next_id
+
+
 def _build_indices(args, papers) -> dict:
     summarizer = None if args.no_llm else llm_call
+    incremental = getattr(args, "incremental", False)
 
     stats: dict[str, dict] = {}
     if args.rebuild:
@@ -83,14 +101,31 @@ def _build_indices(args, papers) -> dict:
             drop_collection(c)
 
     if "flat" in args.indices:
+        skip, start_nid = (
+            _incremental_state("bench_flat") if incremental else (set(), 0)
+        )
         print("[runner] Indexing flat leaves (bench_flat)")
-        s = index_flat_leaves(papers, collection_name="bench_flat")
+        s = index_flat_leaves(
+            papers,
+            collection_name="bench_flat",
+            skip_paper_ids=skip,
+            start_node_id=start_nid,
+        )
         stats["bench_flat"] = asdict(s)
         print(f"[runner]   leaves={s.leaves} took={s.seconds:.1f}s")
 
     if "drag" in args.indices:
+        skip, start_nid = (
+            _incremental_state("bench_drag") if incremental else (set(), 0)
+        )
         print("[runner] Indexing DRAG tree (bench_drag)")
-        s = index_drag_tree(papers, collection_name="bench_drag", summarizer=summarizer)
+        s = index_drag_tree(
+            papers,
+            collection_name="bench_drag",
+            summarizer=summarizer,
+            skip_paper_ids=skip,
+            start_node_id=start_nid,
+        )
         stats["bench_drag"] = asdict(s)
         print(
             f"[runner]   leaves={s.leaves} parents={s.parent_nodes} "
@@ -98,9 +133,16 @@ def _build_indices(args, papers) -> dict:
         )
 
     if "raptor" in args.indices:
+        skip, start_nid = (
+            _incremental_state("bench_raptor") if incremental else (set(), 0)
+        )
         print("[runner] Indexing RAPTOR tree (bench_raptor)")
         s = index_raptor_tree(
-            papers, collection_name="bench_raptor", summarizer=summarizer
+            papers,
+            collection_name="bench_raptor",
+            summarizer=summarizer,
+            skip_paper_ids=skip,
+            start_node_id=start_nid,
         )
         stats["bench_raptor"] = asdict(s)
         print(
@@ -111,12 +153,21 @@ def _build_indices(args, papers) -> dict:
     return stats
 
 
-def _run_retrieval(args, questions, retriever_names: list[str]) -> list[dict]:
+def _run_retrieval(
+    args,
+    questions,
+    retriever_names: list[str],
+    raw_path: Path | None = None,
+) -> list[dict]:
     raw_rows: list[dict] = []
     total = len(questions) * len(retriever_names)
     done = 0
     cross_paper = getattr(args, "cross_paper", False)
     weight_schedule = getattr(args, "weight_schedule", False)
+    raw_fh = None
+    if raw_path is not None:
+        raw_path.write_text("", encoding="utf-8")  # truncate any stale content
+        raw_fh = open(raw_path, "a", encoding="utf-8")
     for retriever in retriever_names:
         fn = RETRIEVERS[retriever]
         coll = collection_for(retriever)  # type: ignore[arg-type]
@@ -164,9 +215,14 @@ def _run_retrieval(args, questions, retriever_names: list[str]) -> list[dict]:
                     "metrics": metrics,
                 }
             raw_rows.append(row)
+            if raw_fh is not None:
+                raw_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                raw_fh.flush()
             done += 1
             if done % 10 == 0 or done == total:
-                print(f"[runner]   retrieval progress {done}/{total}")
+                print(f"[runner]   retrieval progress {done}/{total}", flush=True)
+    if raw_fh is not None:
+        raw_fh.close()
     return raw_rows
 
 
@@ -295,6 +351,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refresh-dataset", action="store_true")
     p.add_argument("--rebuild", action="store_true", help="Drop collections before building")
     p.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Skip papers already present in each Qdrant collection "
+            "(detected via paper_id payload). Node-id counter starts past the "
+            "max existing id to avoid UUID collision. Mutually exclusive with "
+            "--rebuild. Cannot recover from a paper that was only partially "
+            "indexed (interrupted mid-paper) — use --rebuild for that case."
+        ),
+    )
+    p.add_argument(
         "--indices",
         nargs="+",
         default=["flat", "drag", "raptor"],
@@ -343,6 +410,13 @@ def main() -> int:
         args.no_llm = True
         args.rebuild = True
 
+    if args.rebuild and args.incremental:
+        print("[runner] --rebuild and --incremental are mutually exclusive.")
+        return 2
+    if args.skip_build and args.incremental:
+        print("[runner] --incremental has no effect with --skip-build; ignoring.")
+        args.incremental = False
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -360,12 +434,8 @@ def main() -> int:
         with open(RESULTS_DIR / "indexing.json", "w", encoding="utf-8") as f:
             json.dump(indexing_stats, f, ensure_ascii=False, indent=2)
 
-    raw_rows = _run_retrieval(args, questions, args.retrievers)
-
     raw_path = RESULTS_DIR / "raw.jsonl"
-    with open(raw_path, "w", encoding="utf-8") as f:
-        for r in raw_rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    raw_rows = _run_retrieval(args, questions, args.retrievers, raw_path=raw_path)
     print(f"[runner] wrote {raw_path}")
 
     agg = _aggregate(raw_rows)

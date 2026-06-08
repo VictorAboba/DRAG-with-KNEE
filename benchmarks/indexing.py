@@ -186,18 +186,32 @@ def _upsert(client_ctx, collection: str, payloads: list[dict]) -> None:
 
 
 def index_flat_leaves(
-    papers: Iterable[Paper], collection_name: str = "bench_flat"
+    papers: Iterable[Paper],
+    collection_name: str = "bench_flat",
+    skip_paper_ids: set[str] | None = None,
+    start_node_id: int = 0,
 ) -> IndexingStats:
     """Flat indexing: every paragraph becomes a parent_id=-1 leaf-root.
 
     No LLM calls. Embedding is over the raw paragraph text. Vanilla dense,
     BM25-only, and hybrid_rrf_flat all share this collection.
+
+    `skip_paper_ids` causes papers whose id is already in the collection to
+    be skipped (used by `--incremental`). `start_node_id` offsets the local
+    node-id counter so new points don't collide with previously-indexed ones.
     """
     stats = IndexingStats()
     start = time.perf_counter()
     payloads: list[dict] = []
-    node_id = 0
+    node_id = start_node_id
+    skip_paper_ids = skip_paper_ids or set()
     for paper in papers:
+        if paper.paper_id in skip_paper_ids:
+            print(
+                f"[index_flat]   skipping {paper.paper_id} (already indexed)",
+                flush=True,
+            )
+            continue
         for para in paper.paragraphs:
             payloads.append(
                 _build_payload(
@@ -237,6 +251,8 @@ def index_drag_tree(
     collection_name: str = "bench_drag",
     width: int = 3,
     summarizer: LLMSummarizer | None = llm_call,
+    skip_paper_ids: set[str] | None = None,
+    start_node_id: int = 0,
 ) -> IndexingStats:
     """Build the DRAG hierarchical tree exactly like rag_lib.build_tree, but
     fed by pre-chunked QASPER paragraphs instead of PDF parsing.
@@ -244,13 +260,21 @@ def index_drag_tree(
     Each paragraph -> LLM-described leaf. Then groups of `width` leaves are
     aggregated into a parent node (with its own LLM description), recursively
     until one root per paper.
+
+    `skip_paper_ids` causes papers whose id is already in the collection to
+    be skipped (used by `--incremental`). `start_node_id` offsets the local
+    node-id counter so new points don't collide with previously-indexed ones.
     """
     stats = IndexingStats()
     start = time.perf_counter()
     all_payloads: list[dict] = []
-    node_id = 0
+    node_id = start_node_id
+    skip_paper_ids = skip_paper_ids or set()
 
-    papers_list = list(papers)
+    papers_list = [p for p in papers if p.paper_id not in skip_paper_ids]
+    skipped = [p.paper_id for p in papers if p.paper_id in skip_paper_ids]
+    for sid in skipped:
+        print(f"[index_drag]   skipping {sid} (already indexed)", flush=True)
     n_papers = len(papers_list)
     for pi, paper in enumerate(papers_list, 1):
         n_paras = len(paper.paragraphs)
@@ -402,6 +426,8 @@ def index_raptor_tree(
     collection_name: str = "bench_raptor",
     shrink_ratio: int = 3,
     summarizer: LLMSummarizer | None = llm_call,
+    skip_paper_ids: set[str] | None = None,
+    start_node_id: int = 0,
 ) -> IndexingStats:
     """RAPTOR-style hierarchical tree.
 
@@ -411,13 +437,21 @@ def index_raptor_tree(
     repeat until the level has <= 1 node.
 
     `shrink_ratio` bounds the cluster count per level: k_max = ceil(n / shrink_ratio).
+
+    `skip_paper_ids` causes papers whose id is already in the collection to
+    be skipped (used by `--incremental`). `start_node_id` offsets the local
+    node-id counter so new points don't collide with previously-indexed ones.
     """
     stats = IndexingStats()
     start = time.perf_counter()
     all_payloads: list[dict] = []
-    node_id = 0
+    node_id = start_node_id
+    skip_paper_ids = skip_paper_ids or set()
 
-    papers_list = list(papers)
+    papers_list = [p for p in papers if p.paper_id not in skip_paper_ids]
+    skipped = [p.paper_id for p in papers if p.paper_id in skip_paper_ids]
+    for sid in skipped:
+        print(f"[index_raptor]   skipping {sid} (already indexed)", flush=True)
     n_papers = len(papers_list)
     for pi, paper in enumerate(papers_list, 1):
         n_paras = len(paper.paragraphs)
@@ -534,3 +568,64 @@ def drop_collection(collection_name: str) -> None:
     with RAGalicClient() as client_ctx:
         if client_ctx.client.collection_exists(collection_name):
             client_ctx.client.delete_collection(collection_name)
+
+
+def existing_paper_ids(collection_name: str) -> set[str]:
+    """Return the set of distinct paper_id payload values in a collection.
+
+    Returns an empty set if the collection does not exist. Used by
+    `--incremental` mode in the runner to skip already-indexed papers.
+
+    Scrolls the whole collection with payload trimmed to just `paper_id`.
+    For benchmark-sized collections (~500-2000 points) this is fast.
+    """
+    with RAGalicClient() as client_ctx:
+        if not client_ctx.client.collection_exists(collection_name):
+            return set()
+        paper_ids: set[str] = set()
+        next_page = None
+        while True:
+            batch, next_page = client_ctx.client.scroll(
+                collection_name=collection_name,
+                with_payload=["paper_id"],
+                with_vectors=False,
+                limit=1000,
+                offset=next_page,
+            )
+            for point in batch:
+                pid = point.payload.get("paper_id") if point.payload else None
+                if pid:
+                    paper_ids.add(pid)
+            if next_page is None:
+                break
+        return paper_ids
+
+
+def max_existing_node_id(collection_name: str) -> int:
+    """Return the highest `id` payload integer in the collection, or -1 if empty.
+
+    Used by `--incremental` to start the per-build node-id counter past any
+    previously-indexed ids. This is critical because `_node_uuid` is keyed
+    on (collection, node_id) — colliding ids would silently overwrite
+    existing points.
+    """
+    with RAGalicClient() as client_ctx:
+        if not client_ctx.client.collection_exists(collection_name):
+            return -1
+        max_id = -1
+        next_page = None
+        while True:
+            batch, next_page = client_ctx.client.scroll(
+                collection_name=collection_name,
+                with_payload=["id"],
+                with_vectors=False,
+                limit=1000,
+                offset=next_page,
+            )
+            for point in batch:
+                nid = point.payload.get("id") if point.payload else None
+                if isinstance(nid, int) and nid > max_id:
+                    max_id = nid
+            if next_page is None:
+                break
+        return max_id

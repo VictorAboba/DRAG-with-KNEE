@@ -3,4 +3,5 @@ __pycache__/
 test*
 !benchmarks/test_metrics.py
 benchmarks/cache/
+benchmarks/results/runner_drag.log
 rag_lib/qdrant_db/collection/

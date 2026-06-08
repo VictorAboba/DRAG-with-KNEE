@@ -64,7 +64,7 @@ retrieval phase any number of times without touching the LLM.
 
 ## Smoke test (~30 s, no API calls)
 
-Verifies the full pipeline — QASPER load, three indices, all 8 retrievers,
+Verifies the full pipeline — QASPER load, three indices, all 13 retrievers,
 metrics, report — on a tiny slice with text-truncation in place of LLM
 descriptions. Run this before spending API budget on the real run.
 
@@ -84,6 +84,23 @@ python -m benchmarks.runner --num-papers 5 --max-questions 40 --rebuild
 # Subsequent runs: reuse indices, change retriever set / k
 python -m benchmarks.runner --skip-build --k 10
 python -m benchmarks.runner --skip-build --retrievers drag_beam_knee drag_beam_sensitive_knee
+```
+
+## Indexing modes — `--rebuild` / `--incremental` / `--skip-build`
+
+| Mode | What it does | When to use |
+|---|---|---|
+| (default) | Index every paper in the slice; error if collection exists | First run from empty |
+| `--rebuild` | Drop all three collections, then index every paper | Schema change, want to start clean, or recover from a partial index |
+| `--incremental` | Detect already-indexed papers via `paper_id` payload and skip them. Node-id counter starts past the max existing id to avoid UUID collision | Scaled up the slice (e.g. 5 → 10 papers) and want to add only the new ones without re-running the LLM on the existing 5 |
+| `--skip-build` | Don't touch the indices at all, jump straight to retrieval | Iterate on retrievers / metrics with no LLM cost |
+
+`--rebuild` and `--incremental` are mutually exclusive. `--incremental` + `--skip-build` is harmless but `--incremental` becomes a no-op (warned). `--incremental` cannot recover a paper that was *partially* indexed (interrupted mid-paper) — use `--rebuild` for that case.
+
+```powershell
+# Index the first 5 papers, then later add 5 more without re-paying the LLM:
+python -m benchmarks.runner --num-papers 5  --max-questions 40 --rebuild
+python -m benchmarks.runner --num-papers 10 --max-questions 60 --incremental
 ```
 
 ## Outputs
