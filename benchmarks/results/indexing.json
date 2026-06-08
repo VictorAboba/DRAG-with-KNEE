@@ -1,14 +1,20 @@
 {
+  "bench_flat": {
+    "leaves": 530,
+    "parent_nodes": 0,
+    "llm_calls": 0,
+    "seconds": 1566.6179476999969
+  },
   "bench_drag": {
-    "leaves": 216,
-    "parent_nodes": 108,
-    "llm_calls": 324,
-    "seconds": 2005.3146135999996
+    "leaves": 530,
+    "parent_nodes": 268,
+    "llm_calls": 798,
+    "seconds": 4618.008315500003
   },
   "bench_raptor": {
-    "leaves": 216,
-    "parent_nodes": 15,
-    "llm_calls": 15,
-    "seconds": 1002.8690429999988
+    "leaves": 530,
+    "parent_nodes": 32,
+    "llm_calls": 32,
+    "seconds": 2686.971797399994
   }
 }
