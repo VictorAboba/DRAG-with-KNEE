@@ -118,11 +118,25 @@ python -m benchmarks.runner --num-papers 10 --max-questions 60 --incremental
 - **Sensitivity sweep**: rerun `drag_beam_sensitive_knee` with several `--sensitivity` values (CLI arg can be added) to characterize the trade-off.
 - **DRAG vs RAPTOR**: both are hierarchical. Differences come from construction (structural tree vs GMM clustering) and from beam-with-knee vs collapsed-tree retrieval.
 
+## Node descriptions for `bench_drag`
+
+As of the abstract+bullets refactor, leaf and parent nodes in the DRAG tree are annotated by `benchmarks/rich_descriptor.py` instead of `rag_lib.build_tree.DESCRIPTOR_SYSTEM_PROMPT`. The schema is two-form, but **leaves and parents are produced differently**:
+
+| Node | `abstract` (→ payload `description` → dense side) | `bullets` (→ payload `keywords` → BM25 side) |
+|---|---|---|
+| Leaf | LLM call with `LEAF_PROMPT` (1–2 sentences, paraphrase-friendly) | LLM call: 5–8 short phrases preserving acronyms / numbers / entity names verbatim |
+| Parent | LLM call with `PARENT_PROMPT` (1–2 sentence synthesis of children) | **Dedup-union of child bullets**, capped at 10. No LLM call. |
+
+The split mirrors `rag_lib.build_tree.create_parent_node_and_update_children`, which also computes parent keywords as a union of child keywords. Asking the LLM to redo that dedup at every parent level both costs more and loses high-entropy terms; the union path is cheaper and more faithful.
+
+The leaf prompt is tuned for academic NLP / ML papers and explicitly forbids stage-setting like "this paragraph" / "the authors" / "we". RAPTOR's parent nodes still use the old `rag_lib` summarizer prompt — that's a controlled reference: the two hierarchical methods now differ in description quality AND construction (structural width-3 vs GMM clustering), so a remaining DRAG-vs-RAPTOR gap after this change is attributable to construction, not prompt.
+
 ## Caveats / known confounds
 
-- DRAG's leaf descriptions are LLM-enhanced; RAPTOR's leaves use raw paragraph
-  text (as in the original RAPTOR paper). To control for this you could rerun
-  RAPTOR with leaf descriptions added — `index_raptor_tree` would need a flag.
+- `bench_drag` uses LLM-enhanced two-form descriptions (abstract + bullets);
+  `bench_raptor`'s leaves use raw paragraph text and parents use the old
+  rag_lib summarizer. To control for the description-quality lever you could
+  retrofit `index_raptor_tree` to call `describe_parent_rich` too.
 - `bench_flat` uses raw paragraph text (no LLM). That's the standard baseline
   and the cleanest ablation for hierarchy.
 - QASPER evidence matching uses normalize-and-substring; very short or

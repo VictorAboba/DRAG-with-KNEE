@@ -32,6 +32,11 @@ from rag_lib.utils import llm_call
 from rag_lib.build_tree import DESCRIPTOR_SYSTEM_PROMPT
 
 from .datasets import Paper, Paragraph
+from .rich_descriptor import (
+    describe_leaf_rich,
+    describe_parent_rich,
+    describe_parent_with_bullets,
+)
 
 
 # Signature matches rag_lib.utils.llm_call: (messages, structured_output) -> (content, reasoning)
@@ -283,11 +288,14 @@ def index_drag_tree(
             f"{n_paras} paragraphs",
             flush=True,
         )
-        # Leaves
+        # Leaves — rich (abstract + bullets) descriptions, stored in
+        # the existing `description` / `keywords` payload fields so the
+        # rest of the pipeline (`_dense_text`, `_sparse_text`, search.py)
+        # needs no changes.
         leaf_payloads: list[dict] = []
         leaf_t0 = time.perf_counter()
         for li, para in enumerate(paper.paragraphs, 1):
-            desc = _describe_leaf(para, summarizer)
+            desc = describe_leaf_rich(para, summarizer)
             if summarizer is not None:
                 stats.llm_calls += 1
             if li % 5 == 0 or li == n_paras:
@@ -303,8 +311,8 @@ def index_drag_tree(
                     paper_id=paper.paper_id,
                     parent_id=-2,  # placeholder, fixed up below
                     child_ids=[],
-                    description=desc.description,
-                    keywords=desc.keywords,
+                    description=desc.abstract,
+                    keywords=desc.bullets,
                     page_start=para.global_idx,
                     page_end=para.global_idx,
                     paragraph_id=para.paragraph_id,
@@ -332,7 +340,7 @@ def index_drag_tree(
                     new_level.append(group[0])
                     continue
                 child_pairs = [(g["description"] or "", g["keywords"]) for g in group]
-                desc = _describe_parent(child_pairs, summarizer)
+                desc = describe_parent_rich(child_pairs, summarizer)
                 if summarizer is not None:
                     stats.llm_calls += 1
                 parent_payload = _build_payload(
@@ -340,8 +348,8 @@ def index_drag_tree(
                     paper_id=paper.paper_id,
                     parent_id=-2,
                     child_ids=[g["id"] for g in group],
-                    description=desc.description,
-                    keywords=desc.keywords or sorted({kw for _, kws in child_pairs for kw in kws}),
+                    description=desc.abstract,
+                    keywords=desc.bullets or sorted({kw for _, kws in child_pairs for kw in kws}),
                     page_start=min(g["page_start"] for g in group),
                     page_end=max(g["page_end"] for g in group),
                     paragraph_id=None,
@@ -509,7 +517,9 @@ def index_raptor_tree(
                     continue
                 members = [current_level_payloads[i] for i in members_idx]
                 child_pairs = [(m["description"] or "", m["keywords"]) for m in members]
-                desc = _describe_parent(child_pairs, summarizer)
+                # RAPTOR leaves are raw text with no bullets, so the LLM has
+                # to extract bullets at the parent level — not just abstract.
+                desc = describe_parent_with_bullets(child_pairs, summarizer)
                 if summarizer is not None:
                     stats.llm_calls += 1
                 parent_payload = _build_payload(
@@ -517,8 +527,8 @@ def index_raptor_tree(
                     paper_id=paper.paper_id,
                     parent_id=-2,
                     child_ids=[m["id"] for m in members],
-                    description=desc.description,
-                    keywords=desc.keywords or sorted({kw for _, kws in child_pairs for kw in kws}),
+                    description=desc.abstract,
+                    keywords=desc.bullets or sorted({kw for _, kws in child_pairs for kw in kws}),
                     page_start=min(m["page_start"] for m in members),
                     page_end=max(m["page_end"] for m in members),
                     paragraph_id=None,
