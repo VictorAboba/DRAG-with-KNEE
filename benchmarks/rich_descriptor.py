@@ -1,19 +1,30 @@
-"""Two-form node descriptions for the DRAG tree, retrieval-optimized.
+"""Hybrid leaf / parent descriptors for the DRAG and RAPTOR trees.
 
-The existing ``rag_lib`` descriptor produces a single ``description`` string
-written in regulatory-documentation style. For QASPER scientific papers
-this trades retrieval signal for human readability — and the benchmark
-shows DRAG losing to flat hybrid as a result.
+After two iterations we landed on a clean labor split:
 
-This module replaces leaf+parent annotation for ``bench_drag`` ONLY, with
-two complementary outputs per node:
+    LEAVES   raw paragraph text -> dense embedding (preserves discriminative
+                                                    facts that a paraphrase
+                                                    would lose)
+             LLM-generated bullets -> BM25 (high-entropy terms: acronyms,
+                                            method/dataset/model names,
+                                            numbers with units)
 
-    abstract  1-2 sentences, paraphrase-friendly  -> dense embedding
-    bullets   5-8 short facts, BM25-friendly      -> sparse / keywords
+    PARENTS  LLM-synthesized abstract -> dense embedding (theme that
+                                                          connects children)
+             Dedup-union of child bullets -> BM25 (the leaf-level
+                                                   keyword pool, bubbled up)
 
-``bench_raptor`` keeps its raw-text leaves + the old summarizer prompt on
-parents, so we get a controlled comparison: DRAG-old vs DRAG-rich at
-identical tree shape, with RAPTOR sitting fixed as the reference point.
+Rationale: the previous "abstract+bullets on every node" variant made
+neighboring tree nodes look too similar in dense space — knee curves
+flattened, beams widened, top-5 recall collapsed even as right_sized_recall
+went up. Going back to raw text at the leaf level keeps dense-side
+discrimination, while LLM-bullets give BM25 the high-entropy tokens
+that raw text fragments often bury inside grammatical context.
+
+DRAG and RAPTOR now follow the same convention; the only difference left
+between them is tree construction (structural width-3 grouping vs GMM
+clustering). RAPTOR previously had empty BM25 signal at the leaf level
+(no LLM call at all) — this convention fixes that.
 """
 
 from __future__ import annotations
@@ -50,6 +61,26 @@ class RichDescriptorOutput(BaseModel):
     )
 
 
+class LeafBulletsOutput(BaseModel):
+    """LLM output for a LEAF node — bullets only.
+
+    Raw paragraph text becomes the leaf's ``description`` field (and thus
+    the dense-embedding input) — we trust it more than an LLM paraphrase
+    for discriminative leaf-level matching. The LLM job at this level is
+    only to extract a clean BM25 keyword pool from the paragraph.
+    """
+
+    bullets: list[str] = Field(
+        description=(
+            "5-8 short BM25-friendly facts. Each bullet is one specific "
+            "phrase under 12 words: a method name, dataset, model, number, "
+            "finding, term, or entity. Preserve acronyms verbatim (BLEU, "
+            "BERT, F1, GLUE — not 'the BLEU score'). Preserve numbers "
+            "with their units. One concept per bullet, no filler."
+        ),
+    )
+
+
 class ParentAbstractOutput(BaseModel):
     """LLM output for a PARENT node — abstract only.
 
@@ -68,6 +99,30 @@ class ParentAbstractOutput(BaseModel):
             "Do NOT start with 'this section', 'the authors', 'we', 'our'."
         ),
     )
+
+
+LEAF_BULLETS_PROMPT = """# Role
+You annotate fragments of academic NLP / ML / scientific papers for the BM25 side of a hybrid retrieval system. The dense side embeds the raw paragraph text directly — your job is ONLY to extract a clean keyword/short-phrase pool that BM25 can match against questions verbatim.
+
+# Input
+"Raw Page Content": a single paragraph from a scientific paper.
+
+# Task
+Produce 5-8 BM25-friendly bullets.
+
+# Rules
+- Each bullet is ONE high-entropy phrase under 12 words.
+- Preserve acronyms VERBATIM and standalone: BLEU, F1, BERT, GLUE, GPT-3, SST-2 — NOT "the BLEU metric".
+- Preserve numbers with units and context: "62.3 F1 on SST-2", "12-layer transformer", "+2.1 BLEU".
+- Include: method names, model names, dataset names, task names, specific findings, technical terms, entities.
+- Exclude: generic prose, filler words, full sentences. No bullet should read like English narrative.
+- If two surface forms of the same concept appear (e.g. "BLEU" and "BLEU score"), keep the standalone form.
+- If the input is empty or only artifacts (citations only, table noise), return [].
+
+# Output
+JSON only — no markdown code blocks, no commentary:
+{"bullets": ["<phrase>", "<phrase>", ...]}
+"""
 
 
 LEAF_PROMPT = """# Role
@@ -185,6 +240,35 @@ def _truncate(text: str, max_chars: int = 800) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rsplit(" ", 1)[0] + " ..."
+
+
+def describe_leaf_bullets_only(
+    paragraph: Paragraph, summarizer: LLMSummarizer | None
+) -> LeafBulletsOutput:
+    """Extract BM25 bullets from a paragraph. Dense side uses raw text directly.
+
+    This is the current default leaf annotator (since the "abstract+bullets
+    on every node" variant flattened the embedding space and tanked top-5
+    ranking — see commit history). Caller is expected to store
+    ``paragraph.text`` in the payload's ``description`` field and
+    ``output.bullets`` in the ``keywords`` field.
+
+    No-LLM fallback returns empty bullets — BM25 then sees only filename
+    and raw text, which is still strictly better than the pre-rich state.
+    """
+    if summarizer is None:
+        return LeafBulletsOutput(bullets=[])
+    messages = [
+        {"role": "system", "content": LEAF_BULLETS_PROMPT},
+        {"role": "user", "content": f"Raw Page Content:\n{paragraph.text}"},
+    ]
+    for _ in range(3):
+        try:
+            output_str, _ = summarizer(messages, LeafBulletsOutput)
+            return LeafBulletsOutput.model_validate_json(output_str)
+        except Exception:
+            continue
+    return LeafBulletsOutput(bullets=[])
 
 
 def describe_leaf_rich(

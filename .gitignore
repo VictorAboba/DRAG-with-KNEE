@@ -4,4 +4,6 @@ test*
 !benchmarks/test_metrics.py
 benchmarks/cache/
 benchmarks/results/runner_drag.log
+benchmarks/results/runner_rich.log
+benchmarks/results/runner_hybrid.log
 rag_lib/qdrant_db/collection/

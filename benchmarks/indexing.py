@@ -33,9 +33,8 @@ from rag_lib.build_tree import DESCRIPTOR_SYSTEM_PROMPT
 
 from .datasets import Paper, Paragraph
 from .rich_descriptor import (
-    describe_leaf_rich,
+    describe_leaf_bullets_only,
     describe_parent_rich,
-    describe_parent_with_bullets,
 )
 
 
@@ -288,14 +287,16 @@ def index_drag_tree(
             f"{n_paras} paragraphs",
             flush=True,
         )
-        # Leaves — rich (abstract + bullets) descriptions, stored in
-        # the existing `description` / `keywords` payload fields so the
-        # rest of the pipeline (`_dense_text`, `_sparse_text`, search.py)
-        # needs no changes.
+        # Leaves — HYBRID convention: raw paragraph text on the dense side
+        # (preserves discriminative content the LLM paraphrase loses),
+        # LLM-generated bullets on the BM25 side (high-entropy tokens that
+        # raw text buries inside grammatical context). Stored in the
+        # existing description / keywords payload fields so search.py /
+        # _dense_text / _sparse_text need no changes.
         leaf_payloads: list[dict] = []
         leaf_t0 = time.perf_counter()
         for li, para in enumerate(paper.paragraphs, 1):
-            desc = describe_leaf_rich(para, summarizer)
+            desc = describe_leaf_bullets_only(para, summarizer)
             if summarizer is not None:
                 stats.llm_calls += 1
             if li % 5 == 0 or li == n_paras:
@@ -311,7 +312,7 @@ def index_drag_tree(
                     paper_id=paper.paper_id,
                     parent_id=-2,  # placeholder, fixed up below
                     child_ids=[],
-                    description=desc.abstract,
+                    description=para.text,
                     keywords=desc.bullets,
                     page_start=para.global_idx,
                     page_end=para.global_idx,
@@ -468,8 +469,23 @@ def index_raptor_tree(
             f"{n_paras} paragraphs",
             flush=True,
         )
+        # HYBRID convention (same as DRAG leaves): raw text on dense side,
+        # LLM-extracted bullets on BM25 side. Previously RAPTOR leaves had
+        # empty keywords, so BM25-side hybrid retrieval had nothing to
+        # match at leaf level — this fixes that.
         leaves: list[dict] = []
-        for para in paper.paragraphs:
+        leaf_t0 = time.perf_counter()
+        for li, para in enumerate(paper.paragraphs, 1):
+            desc = describe_leaf_bullets_only(para, summarizer)
+            if summarizer is not None:
+                stats.llm_calls += 1
+            if li % 5 == 0 or li == n_paras:
+                rate = li / max(time.perf_counter() - leaf_t0, 1e-6)
+                print(
+                    f"[index_raptor]   leaves {li}/{n_paras} ({rate:.1f}/s, "
+                    f"llm_calls={stats.llm_calls})",
+                    flush=True,
+                )
             leaves.append(
                 _build_payload(
                     node_id=node_id,
@@ -477,7 +493,7 @@ def index_raptor_tree(
                     parent_id=-2,
                     child_ids=[],
                     description=para.text,
-                    keywords=[],
+                    keywords=desc.bullets,
                     page_start=para.global_idx,
                     page_end=para.global_idx,
                     paragraph_id=para.paragraph_id,
@@ -517,9 +533,10 @@ def index_raptor_tree(
                     continue
                 members = [current_level_payloads[i] for i in members_idx]
                 child_pairs = [(m["description"] or "", m["keywords"]) for m in members]
-                # RAPTOR leaves are raw text with no bullets, so the LLM has
-                # to extract bullets at the parent level — not just abstract.
-                desc = describe_parent_with_bullets(child_pairs, summarizer)
+                # RAPTOR leaves now carry LLM bullets (hybrid convention),
+                # so parents can union them like DRAG does — no need to
+                # ask the LLM to re-extract bullets at parent level.
+                desc = describe_parent_rich(child_pairs, summarizer)
                 if summarizer is not None:
                     stats.llm_calls += 1
                 parent_payload = _build_payload(
