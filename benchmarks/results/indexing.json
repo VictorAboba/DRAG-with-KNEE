@@ -3,18 +3,18 @@
     "leaves": 530,
     "parent_nodes": 0,
     "llm_calls": 0,
-    "seconds": 719.6997249999995
+    "seconds": 278.88242189999437
   },
   "bench_drag": {
     "leaves": 530,
     "parent_nodes": 268,
     "llm_calls": 798,
-    "seconds": 6691.8467243000005
+    "seconds": 5643.250054799995
   },
   "bench_raptor": {
     "leaves": 530,
     "parent_nodes": 32,
-    "llm_calls": 32,
-    "seconds": 2314.6067655000006
+    "llm_calls": 562,
+    "seconds": 7680.430342299995
   }
 }

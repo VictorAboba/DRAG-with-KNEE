@@ -214,6 +214,12 @@ def _run_retrieval(
                     "error": None,
                     "metrics": metrics,
                 }
+                # Subtree-aware retrievers (drag_subtree) carry extra structural
+                # info — pass it through to raw.jsonl so the subtree-aware
+                # metric module can read it without rerunning retrieval.
+                if res.subtree_groups:
+                    row["subtree_groups"] = res.subtree_groups
+                    row["subtree_decisions"] = res.subtree_decisions
             raw_rows.append(row)
             if raw_fh is not None:
                 raw_fh.write(json.dumps(row, ensure_ascii=False) + "\n")

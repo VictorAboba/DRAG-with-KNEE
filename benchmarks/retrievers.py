@@ -61,6 +61,10 @@ RetrieverName = Literal[
     "drag_beam_sensk_0.5",
     "drag_beam_sensk_0.75",
     "drag_beam_scheduled",
+    "drag_subtree",
+    "drag_subtree_1p",
+    "drag_subtree_drill",
+    "drag_subtree_tight",
 ]
 
 
@@ -71,6 +75,15 @@ class RetrievalResult:
     k_returned: int
     latency_s: float
     raw_payloads: list[dict] = field(default_factory=list)
+    # For subtree-aware retrievers (drag_subtree): list of subtree groups,
+    # each a list of leaf paragraph_ids belonging to that subtree (in
+    # document order). For non-subtree retrievers this stays empty and the
+    # subtree-aware metrics treat each row as a single flat group equal
+    # to paragraph_ids.
+    subtree_groups: list[list[str]] = field(default_factory=list)
+    # Per-subtree decision tag for diagnostics (drill_down / parent_dominates
+    # / knee_split / leaf). Parallel to subtree_groups.
+    subtree_decisions: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +607,132 @@ def retrieve_drag_beam_scheduled(
 
 
 # ---------------------------------------------------------------------------
+# DRAG-Subtree — retrieval as coherent-context selection
+# ---------------------------------------------------------------------------
+
+
+def _drag_subtree_with(
+    name: str,
+    query: str,
+    paper_id: str | None,
+    collection_name: str,
+    max_papers: int,
+    knee_sensitivity: float,
+    parent_win_margin: float,
+    dominate_ratio: float,
+) -> RetrievalResult:
+    """Shared body of all drag_subtree* variants. Only the preset differs."""
+    from .subtree_search import subtree_search
+
+    t0 = time.perf_counter()
+    subtrees = subtree_search(
+        query=query,
+        paper_id=paper_id,
+        collection_name=collection_name,
+        max_papers=max_papers,
+        knee_sensitivity=knee_sensitivity,
+        parent_win_margin=parent_win_margin,
+        dominate_ratio=dominate_ratio,
+    )
+    elapsed = time.perf_counter() - t0
+
+    # Flatten across subtrees in rank order, dedupe by first occurrence.
+    seen: set[str] = set()
+    pids: list[str] = []
+    subtree_groups: list[list[str]] = []
+    subtree_decisions: list[str] = []
+    for st in subtrees:
+        group: list[str] = []
+        for pid in st.descendant_leaf_paragraph_ids:
+            if pid not in seen:
+                seen.add(pid)
+                pids.append(pid)
+                group.append(pid)
+        subtree_groups.append(group)
+        subtree_decisions.append(st.decision)
+
+    return RetrievalResult(
+        retriever=name,  # type: ignore[arg-type]
+        paragraph_ids=pids,
+        k_returned=len(pids),
+        latency_s=elapsed,
+        raw_payloads=[],
+        subtree_groups=subtree_groups,
+        subtree_decisions=subtree_decisions,
+    )
+
+
+def retrieve_drag_subtree(
+    query: str,
+    paper_id: str | None,
+    k: int,  # ignored — subtree decides its own scope per question
+    collection_name: str = "bench_drag",
+    **_kw,
+) -> RetrievalResult:
+    """DRAG-Subtree (defaults): 3 papers, knee=0.5, parent_win_margin=1.1.
+
+    Stage 1 picks candidate papers via content-aware top-K leaf-and-parent
+    search (not via root summary alone — see attribution analysis showing
+    47% wrong-paper rate when using only-roots selection).
+
+    Stage 2 walks each paper's tree from root applying the three-case knee
+    rule: parent_dominates / drill_down / knee_split / leaf.
+
+    Result.paragraph_ids is the flattened concatenation of all subtrees'
+    descendant leaves (so existing recall@k metrics still apply). The
+    structural info — which leaves belong to which returned subtree — is
+    in `subtree_groups` and feeds the subtree-aware metrics.
+    """
+    return _drag_subtree_with(
+        name="drag_subtree",
+        query=query, paper_id=paper_id, collection_name=collection_name,
+        max_papers=3, knee_sensitivity=0.5,
+        parent_win_margin=1.1, dominate_ratio=1.3,
+    )
+
+
+def retrieve_drag_subtree_1p(
+    query: str, paper_id: str | None, k: int,
+    collection_name: str = "bench_drag", **_kw,
+) -> RetrievalResult:
+    """Top-1 candidate paper only. Coherence becomes 1.0 by construction."""
+    return _drag_subtree_with(
+        name="drag_subtree_1p",
+        query=query, paper_id=paper_id, collection_name=collection_name,
+        max_papers=1, knee_sensitivity=0.5,
+        parent_win_margin=1.1, dominate_ratio=1.3,
+    )
+
+
+def retrieve_drag_subtree_drill(
+    query: str, paper_id: str | None, k: int,
+    collection_name: str = "bench_drag", **_kw,
+) -> RetrievalResult:
+    """Force drill-down: high parent_win_margin (parent rarely wins) and
+    low dominate_ratio (small child wins → drill). 3 papers (default)."""
+    return _drag_subtree_with(
+        name="drag_subtree_drill",
+        query=query, paper_id=paper_id, collection_name=collection_name,
+        max_papers=3, knee_sensitivity=0.85,
+        parent_win_margin=1.5, dominate_ratio=1.1,
+    )
+
+
+def retrieve_drag_subtree_tight(
+    query: str, paper_id: str | None, k: int,
+    collection_name: str = "bench_drag", **_kw,
+) -> RetrievalResult:
+    """Most aggressive: 1 paper + forced drill + tight knee. The "return
+    one focused fact" mode — context budget should be minimal."""
+    return _drag_subtree_with(
+        name="drag_subtree_tight",
+        query=query, paper_id=paper_id, collection_name=collection_name,
+        max_papers=1, knee_sensitivity=0.85,
+        parent_win_margin=1.5, dominate_ratio=1.1,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -611,6 +750,10 @@ RETRIEVERS = {
     "drag_beam_sensk_0.5": retrieve_drag_beam_sensk_050,
     "drag_beam_sensk_0.75": retrieve_drag_beam_sensk_075,
     "drag_beam_scheduled": retrieve_drag_beam_scheduled,
+    "drag_subtree": retrieve_drag_subtree,
+    "drag_subtree_1p": retrieve_drag_subtree_1p,
+    "drag_subtree_drill": retrieve_drag_subtree_drill,
+    "drag_subtree_tight": retrieve_drag_subtree_tight,
 }
 
 
