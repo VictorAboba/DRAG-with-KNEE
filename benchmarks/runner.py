@@ -37,6 +37,7 @@ from .indexing import (
     index_raptor_tree,
     max_existing_node_id,
 )
+from .qexp_indexing import index_qexp_leaves, QEXP_COLLECTION
 from .metrics import aggregate, per_query_metrics
 from .retrievers import (
     RETRIEVERS,
@@ -96,7 +97,7 @@ def _build_indices(args, papers) -> dict:
 
     stats: dict[str, dict] = {}
     if args.rebuild:
-        for c in ("bench_flat", "bench_drag", "bench_raptor"):
+        for c in ("bench_flat", "bench_drag", "bench_raptor", QEXP_COLLECTION):
             print(f"[runner] Dropping collection {c}")
             drop_collection(c)
 
@@ -148,6 +149,23 @@ def _build_indices(args, papers) -> dict:
         print(
             f"[runner]   leaves={s.leaves} parents={s.parent_nodes} "
             f"llm_calls={s.llm_calls} took={s.seconds:.1f}s"
+        )
+
+    if "qexp" in args.indices:
+        # Leaf-only collection with three named vectors (dense, sparse_bullets,
+        # sparse_questions) for the question-expansion isolation experiment.
+        # `--incremental` not wired here yet — qexp is a sweep collection,
+        # rebuild from scratch when needed.
+        print("[runner] Indexing QExp leaves (bench_qexp)")
+        s = index_qexp_leaves(
+            papers,
+            collection_name=QEXP_COLLECTION,
+            summarizer=summarizer,
+        )
+        stats[QEXP_COLLECTION] = asdict(s)
+        print(
+            f"[runner]   leaves={s.leaves} llm_calls={s.llm_calls} "
+            f"took={s.seconds:.1f}s"
         )
 
     return stats
@@ -371,7 +389,7 @@ def parse_args() -> argparse.Namespace:
         "--indices",
         nargs="+",
         default=["flat", "drag", "raptor"],
-        choices=["flat", "drag", "raptor"],
+        choices=["flat", "drag", "raptor", "qexp"],
     )
     p.add_argument(
         "--skip-build", action="store_true", help="Reuse existing Qdrant collections"

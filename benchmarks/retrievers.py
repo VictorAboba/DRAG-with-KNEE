@@ -65,6 +65,10 @@ RetrieverName = Literal[
     "drag_subtree_1p",
     "drag_subtree_drill",
     "drag_subtree_tight",
+    "qexp_dense",
+    "qexp_bullets",
+    "qexp_questions",
+    "qexp_hybrid_all",
 ]
 
 
@@ -736,6 +740,127 @@ def retrieve_drag_subtree_tight(
 # Registry
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Query-expansion isolation experiment (over bench_qexp)
+# Tests three signals separately:
+#   qexp_dense        dense embedding of raw paragraph text
+#   qexp_bullets      BM25 over LLM-extracted bullets only
+#   qexp_questions    BM25 over LLM-anticipated questions only (inverse-HyDE)
+#   qexp_hybrid_all   RRF fusion of all three (control)
+# ---------------------------------------------------------------------------
+
+QEXP_COLLECTION = "bench_qexp"
+
+
+def _qexp_single_vector(
+    query: str, paper_id: str | None, k: int, using_field: str,
+    is_sparse: bool,
+) -> list[ScoredPoint]:
+    f = _paper_filter(paper_id)
+    with RAGalicClient() as ctx:
+        client = ctx.client
+        model = (
+            client.sparse_embedding_model_name if is_sparse  # type: ignore
+            else client.embedding_model_name  # type: ignore
+        )
+        return client.query_points(
+            collection_name=QEXP_COLLECTION,
+            query=Document(text=query, model=model),
+            using=using_field,
+            query_filter=f,
+            limit=k,
+        ).points
+
+
+def retrieve_qexp_dense(
+    query: str, paper_id: str | None, k: int, **_kw,
+) -> RetrievalResult:
+    """Dense embedding over raw paragraph text — the discriminative-content
+    baseline. No BM25 side. Matches the user's query against the actual
+    paragraph content via cosine on jinaai/jina-embeddings-v3."""
+    t0 = time.perf_counter()
+    points = _qexp_single_vector(query, paper_id, k, "dense", is_sparse=False)
+    return RetrievalResult(
+        retriever="qexp_dense",
+        paragraph_ids=_points_to_paragraph_ids(points),
+        k_returned=len(points), latency_s=time.perf_counter() - t0,
+        raw_payloads=[p.payload for p in points],
+    )
+
+
+def retrieve_qexp_bullets(
+    query: str, paper_id: str | None, k: int, **_kw,
+) -> RetrievalResult:
+    """BM25 over LLM-extracted bullets only. Tests whether high-entropy
+    keyword tokens (acronyms / numbers / model names) are the BM25 signal
+    that matters, independent of questions or raw text."""
+    t0 = time.perf_counter()
+    points = _qexp_single_vector(query, paper_id, k, "sparse_bullets", is_sparse=True)
+    return RetrievalResult(
+        retriever="qexp_bullets",
+        paragraph_ids=_points_to_paragraph_ids(points),
+        k_returned=len(points), latency_s=time.perf_counter() - t0,
+        raw_payloads=[p.payload for p in points],
+    )
+
+
+def retrieve_qexp_questions(
+    query: str, paper_id: str | None, k: int, **_kw,
+) -> RetrievalResult:
+    """BM25 over LLM-anticipated questions only. Inverse-HyDE in isolation:
+    matches the user's query against questions the LLM imagined this
+    paragraph would answer. If this beats qexp_bullets, query-to-question
+    similarity is the key signal."""
+    t0 = time.perf_counter()
+    points = _qexp_single_vector(query, paper_id, k, "sparse_questions", is_sparse=True)
+    return RetrievalResult(
+        retriever="qexp_questions",
+        paragraph_ids=_points_to_paragraph_ids(points),
+        k_returned=len(points), latency_s=time.perf_counter() - t0,
+        raw_payloads=[p.payload for p in points],
+    )
+
+
+def retrieve_qexp_hybrid_all(
+    query: str, paper_id: str | None, k: int, **_kw,
+) -> RetrievalResult:
+    """RRF fusion of all three signals. The ensemble control point: how
+    much does fusing dense + bullets-BM25 + questions-BM25 beat the best
+    individual signal?"""
+    t0 = time.perf_counter()
+    f = _paper_filter(paper_id)
+    with RAGalicClient() as ctx:
+        client = ctx.client
+        dense_model: str = client.embedding_model_name  # type: ignore
+        sparse_model: str = client.sparse_embedding_model_name  # type: ignore
+        points = client.query_points(
+            collection_name=QEXP_COLLECTION,
+            prefetch=[
+                Prefetch(
+                    query=Document(text=query, model=dense_model),
+                    using="dense", limit=k * 3, filter=f,
+                ),
+                Prefetch(
+                    query=Document(text=query, model=sparse_model),
+                    using="sparse_bullets", limit=k * 3, filter=f,
+                ),
+                Prefetch(
+                    query=Document(text=query, model=sparse_model),
+                    using="sparse_questions", limit=k * 3, filter=f,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            query_filter=f,
+            limit=k,
+        ).points
+    return RetrievalResult(
+        retriever="qexp_hybrid_all",
+        paragraph_ids=_points_to_paragraph_ids(points),
+        k_returned=len(points), latency_s=time.perf_counter() - t0,
+        raw_payloads=[p.payload for p in points],
+    )
+
+
 RETRIEVERS = {
     "vanilla_dense": retrieve_vanilla_dense,
     "bm25_only": retrieve_bm25_only,
@@ -754,6 +879,10 @@ RETRIEVERS = {
     "drag_subtree_1p": retrieve_drag_subtree_1p,
     "drag_subtree_drill": retrieve_drag_subtree_drill,
     "drag_subtree_tight": retrieve_drag_subtree_tight,
+    "qexp_dense": retrieve_qexp_dense,
+    "qexp_bullets": retrieve_qexp_bullets,
+    "qexp_questions": retrieve_qexp_questions,
+    "qexp_hybrid_all": retrieve_qexp_hybrid_all,
 }
 
 
@@ -762,4 +891,6 @@ def collection_for(retriever: str) -> str:
         return "bench_raptor"
     if retriever.startswith("drag_"):
         return "bench_drag"
+    if retriever.startswith("qexp_"):
+        return "bench_qexp"
     return "bench_flat"
