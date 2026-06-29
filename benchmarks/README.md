@@ -120,14 +120,14 @@ python -m benchmarks.runner --num-papers 10 --max-questions 60 --incremental
 
 ## Node descriptions for `bench_drag`
 
-Leaf and parent nodes in both `bench_drag` and `bench_raptor` are annotated by `benchmarks/rich_descriptor.py` instead of `rag_lib.build_tree.DESCRIPTOR_SYSTEM_PROMPT`. After the v1 (abstract+bullets-on-every-node) variant flattened embedding space and hurt top-5 ranking, we landed on a **hybrid labor split**:
+Leaf and parent nodes in both `bench_drag` and `bench_raptor` are annotated by `benchmarks/rich_descriptor.py` instead of `rag_lib.build_tree.DESCRIPTOR_SYSTEM_PROMPT`. After the v1 (abstract+bullets-on-every-node) variant flattened embedding space and hurt top-5 ranking, we landed on a **hybrid labor split with question expansion**:
 
 | Node | `description` (→ dense side) | `keywords` (→ BM25 side) | LLM calls |
 |---|---|---|---|
-| Leaf | **raw paragraph text** (preserves discriminative content the LLM paraphrase loses) | LLM-extracted bullets (`LEAF_BULLETS_PROMPT`): 5–8 high-entropy phrases preserving acronyms / numbers / entity names | 1 |
-| Parent | LLM-synthesized abstract (`PARENT_PROMPT`): 1–2 sentence theme connecting the children | Dedup-union of child bullets, capped at 10 | 1 |
+| Leaf | **raw paragraph text** (preserves discriminative content the LLM paraphrase loses) | `LEAF_BULLETS_PROMPT`: 5–8 high-entropy bullets (acronyms, numbers, names) **+** 3–5 *anticipated questions* this paragraph could answer (inverse-HyDE: query-to-question similarity adds to query-to-keyword) | 1 |
+| Parent | LLM-synthesized abstract (`PARENT_PROMPT`): 1–2 sentence theme connecting the children | Dedup-union of child keywords (which already include their questions), capped at 10 | 1 |
 
-Rationale: dense embedding on **raw leaf text** keeps the discriminative content of the original paragraph (rich-paraphrased leaves made neighbouring tree nodes look too similar in dense space — knee curves flattened, beams widened, top-5 collapsed). BM25 at the leaf level gets a clean keyword pool of acronyms / numbers / model names that raw text often buries inside grammatical context. Parents get the LLM-synthesis for theme-level dense matching, with bullets bubbling up via union (matches `rag_lib`'s `all_child_keywords` pattern — cheaper and less lossy than asking the LLM to re-extract).
+Rationale: dense embedding on **raw leaf text** keeps the discriminative content of the original paragraph (rich-paraphrased leaves made neighbouring tree nodes look too similar in dense space — knee curves flattened, beams widened, top-5 collapsed). BM25 at the leaf level gets both (a) a keyword pool of acronyms / numbers / model names that raw text often buries inside grammatical context, and (b) anticipated questions that match a real user query via question-to-question similarity ("What dataset?" matches "What is the source corpus?" better than it matches "WMT-14 En-De, 4.5M sentences"). Parents get the LLM-synthesis for theme-level dense matching, with all leaf-level keywords AND questions bubbling up via union — same shape as `rag_lib`'s `all_child_keywords` pattern.
 
 Both DRAG and RAPTOR now follow the same convention. The only structural difference left between them is tree construction (DRAG: width-3 grouping; RAPTOR: GMM clustering). Previously RAPTOR had empty keywords at the leaf level (no LLM call) so BM25-side hybrid retrieval had nothing to match at the leaf level — the hybrid convention fixes that.
 

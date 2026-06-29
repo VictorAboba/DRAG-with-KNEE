@@ -62,12 +62,24 @@ class RichDescriptorOutput(BaseModel):
 
 
 class LeafBulletsOutput(BaseModel):
-    """LLM output for a LEAF node — bullets only.
+    """LLM output for a LEAF node — bullets + anticipated questions.
 
-    Raw paragraph text becomes the leaf's ``description`` field (and thus
-    the dense-embedding input) — we trust it more than an LLM paraphrase
-    for discriminative leaf-level matching. The LLM job at this level is
-    only to extract a clean BM25 keyword pool from the paragraph.
+    Raw paragraph text becomes the leaf's ``description`` field (dense
+    side). The LLM produces two BM25-side artifacts per leaf:
+
+      bullets               high-entropy factual phrases (method names,
+                            acronyms, numbers, datasets). Match a query
+                            via the keywords *the answer would mention*.
+
+      anticipated_questions plausible questions the paragraph would
+                            answer. Match a query via *question-to-
+                            question similarity* (inverse-HyDE pattern):
+                            a user's "what dataset?" matches "What is
+                            the source corpus?" much better than it
+                            matches "WMT-14 En-De, 4.5M sentences".
+
+    Both go into the ``keywords`` payload (concatenated) — the BM25
+    sparse embedder tokenizes the merged pool.
     """
 
     bullets: list[str] = Field(
@@ -78,6 +90,16 @@ class LeafBulletsOutput(BaseModel):
             "BERT, F1, GLUE — not 'the BLEU score'). Preserve numbers "
             "with their units. One concept per bullet, no filler."
         ),
+    )
+    anticipated_questions: list[str] = Field(
+        description=(
+            "3-5 questions this paragraph could plausibly answer. Each is a "
+            "natural-sounding research question under 15 words, ending with "
+            "'?'. Cover different aspects (what / how / why / how much) of "
+            "what's in the paragraph. Use the same acronyms verbatim that "
+            "appear in the content. NO leading 'this paper' / 'the authors'."
+        ),
+        default_factory=list,
     )
 
 
@@ -102,26 +124,39 @@ class ParentAbstractOutput(BaseModel):
 
 
 LEAF_BULLETS_PROMPT = """# Role
-You annotate fragments of academic NLP / ML / scientific papers for the BM25 side of a hybrid retrieval system. The dense side embeds the raw paragraph text directly — your job is ONLY to extract a clean keyword/short-phrase pool that BM25 can match against questions verbatim.
+You annotate fragments of academic NLP / ML / scientific papers for the BM25 side of a hybrid retrieval system. The dense side embeds the raw paragraph text directly — your job here is to enrich the BM25-side keyword pool so a future question can match this leaf both via factual keywords AND via question-to-question similarity.
 
 # Input
 "Raw Page Content": a single paragraph from a scientific paper.
 
 # Task
-Produce 5-8 BM25-friendly bullets.
+Produce TWO complementary BM25-side outputs.
 
-# Rules
+## 1. bullets (5-8 items)
+High-entropy factual phrases — keywords any sensible answer would mention.
 - Each bullet is ONE high-entropy phrase under 12 words.
 - Preserve acronyms VERBATIM and standalone: BLEU, F1, BERT, GLUE, GPT-3, SST-2 — NOT "the BLEU metric".
 - Preserve numbers with units and context: "62.3 F1 on SST-2", "12-layer transformer", "+2.1 BLEU".
 - Include: method names, model names, dataset names, task names, specific findings, technical terms, entities.
 - Exclude: generic prose, filler words, full sentences. No bullet should read like English narrative.
 - If two surface forms of the same concept appear (e.g. "BLEU" and "BLEU score"), keep the standalone form.
-- If the input is empty or only artifacts (citations only, table noise), return [].
+
+## 2. anticipated_questions (3-5 items)
+Plausible research questions that this paragraph could answer.
+- Each is a NATURAL-sounding question under 15 words, ending with "?".
+- Use the SAME acronyms and entity names that appear in the content (no paraphrase to generic form).
+- Cover different aspects: what / how / why / how-much, depending on what's actually in the paragraph.
+- NO stage-setting: do NOT start with "this paper", "the authors", "in this work". Speak in the third person about the SUBJECT.
+- Example for a paragraph describing a dataset: "How large is WMT-14 En-De?" / "What languages does WMT-14 cover?" — NOT "What does this paper say about the dataset?"
+
+# Hard rules
+- If the input is empty or only artifacts (citations only, table noise), return empty lists for both fields.
+- Do not invent acronyms or numbers not in the paragraph.
+- A bullet and a question should never be word-identical.
 
 # Output
 JSON only — no markdown code blocks, no commentary:
-{"bullets": ["<phrase>", "<phrase>", ...]}
+{"bullets": ["<phrase>", ...], "anticipated_questions": ["<question?>", ...]}
 """
 
 
@@ -245,19 +280,23 @@ def _truncate(text: str, max_chars: int = 800) -> str:
 def describe_leaf_bullets_only(
     paragraph: Paragraph, summarizer: LLMSummarizer | None
 ) -> LeafBulletsOutput:
-    """Extract BM25 bullets from a paragraph. Dense side uses raw text directly.
+    """Annotate a leaf with BM25-side bullets AND anticipated questions.
 
-    This is the current default leaf annotator (since the "abstract+bullets
-    on every node" variant flattened the embedding space and tanked top-5
-    ranking — see commit history). Caller is expected to store
-    ``paragraph.text`` in the payload's ``description`` field and
-    ``output.bullets`` in the ``keywords`` field.
+    The dense side embeds ``paragraph.text`` directly (caller stores it in
+    the payload's ``description`` field). The BM25-side keyword pool is
+    the concatenation of ``output.bullets`` and ``output.anticipated_questions``
+    — both feed the ``keywords`` payload.
 
-    No-LLM fallback returns empty bullets — BM25 then sees only filename
+    Why questions: a user asking "what dataset did they use?" matches
+    "What is the source corpus?" much better via dense+BM25 than via
+    matching the answer phrase "WMT-14 En-De". Inverse-HyDE / question-
+    expansion pattern.
+
+    No-LLM fallback returns empty lists — BM25 then sees only filename
     and raw text, which is still strictly better than the pre-rich state.
     """
     if summarizer is None:
-        return LeafBulletsOutput(bullets=[])
+        return LeafBulletsOutput(bullets=[], anticipated_questions=[])
     messages = [
         {"role": "system", "content": LEAF_BULLETS_PROMPT},
         {"role": "user", "content": f"Raw Page Content:\n{paragraph.text}"},
@@ -268,7 +307,7 @@ def describe_leaf_bullets_only(
             return LeafBulletsOutput.model_validate_json(output_str)
         except Exception:
             continue
-    return LeafBulletsOutput(bullets=[])
+    return LeafBulletsOutput(bullets=[], anticipated_questions=[])
 
 
 def describe_leaf_rich(

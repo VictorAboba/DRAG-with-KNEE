@@ -287,12 +287,13 @@ def index_drag_tree(
             f"{n_paras} paragraphs",
             flush=True,
         )
-        # Leaves — HYBRID convention: raw paragraph text on the dense side
-        # (preserves discriminative content the LLM paraphrase loses),
-        # LLM-generated bullets on the BM25 side (high-entropy tokens that
-        # raw text buries inside grammatical context). Stored in the
-        # existing description / keywords payload fields so search.py /
-        # _dense_text / _sparse_text need no changes.
+        # Leaves — HYBRID convention with question expansion:
+        #   description = raw paragraph text  -> dense side
+        #   keywords    = bullets + anticipated_questions  -> BM25 side
+        # bullets cover keyword-based matching (acronyms, numbers, names);
+        # anticipated_questions cover question-to-question matching when
+        # a real user question shares phrasing with what the LLM imagined
+        # the paragraph would be asked about (inverse-HyDE).
         leaf_payloads: list[dict] = []
         leaf_t0 = time.perf_counter()
         for li, para in enumerate(paper.paragraphs, 1):
@@ -306,6 +307,7 @@ def index_drag_tree(
                     f"llm_calls={stats.llm_calls})",
                     flush=True,
                 )
+            keywords = list(desc.bullets) + list(desc.anticipated_questions)
             leaf_payloads.append(
                 _build_payload(
                     node_id=node_id,
@@ -313,7 +315,7 @@ def index_drag_tree(
                     parent_id=-2,  # placeholder, fixed up below
                     child_ids=[],
                     description=para.text,
-                    keywords=desc.bullets,
+                    keywords=keywords,
                     page_start=para.global_idx,
                     page_end=para.global_idx,
                     paragraph_id=para.paragraph_id,
@@ -470,9 +472,10 @@ def index_raptor_tree(
             flush=True,
         )
         # HYBRID convention (same as DRAG leaves): raw text on dense side,
-        # LLM-extracted bullets on BM25 side. Previously RAPTOR leaves had
-        # empty keywords, so BM25-side hybrid retrieval had nothing to
-        # match at leaf level — this fixes that.
+        # LLM-extracted bullets + anticipated_questions on BM25 side. The
+        # questions enable inverse-HyDE matching (query-to-anticipated-Q)
+        # in addition to keyword matching. RAPTOR leaves previously had
+        # empty keywords entirely.
         leaves: list[dict] = []
         leaf_t0 = time.perf_counter()
         for li, para in enumerate(paper.paragraphs, 1):
@@ -486,6 +489,7 @@ def index_raptor_tree(
                     f"llm_calls={stats.llm_calls})",
                     flush=True,
                 )
+            keywords = list(desc.bullets) + list(desc.anticipated_questions)
             leaves.append(
                 _build_payload(
                     node_id=node_id,
@@ -493,7 +497,7 @@ def index_raptor_tree(
                     parent_id=-2,
                     child_ids=[],
                     description=para.text,
-                    keywords=desc.bullets,
+                    keywords=keywords,
                     page_start=para.global_idx,
                     page_end=para.global_idx,
                     paragraph_id=para.paragraph_id,
